@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-There is no code yet. This directory is currently a **hardware reverse-engineering notebook** for a planned custom-firmware project targeting an off-the-shelf "Ecoworthy" dual-axis solar tracker board, plus an ESPHome bridge to Home Assistant via an ESP-01S. No build system, toolchain, tests, or VCS are set up.
+Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker board, plus an ESPHome bridge to Home Assistant via an ESP-01S. **Phase 0 (toolchain bring-up) is complete:** SDCC + GNU Make + stcgal flashing works, the STC15F2K60S2 runs custom firmware that initializes the 1602A LCD and idles silently. Firmware lives in `EcoWorthyFirmware/` — see its `README.md` for build/flash commands.
 
 ## Layout
 
-- `SolarTracker/Ecoworthy Board Description.txt` — reverse-engineered pinout. Authoritative for hardware wiring until firmware code exists.
+- `EcoWorthyFirmware/` — STC15F2K60S2 firmware (SDCC + GNU Make + stcgal).
+- `SolarTracker/Ecoworthy Board Description.txt` — reverse-engineered pinout. Authoritative for *function* wiring (which pin connects to what on the board). Port assignments are now resolved against the datasheet — see "Verified pin-to-port map" below.
+- `docs/superpowers/` — phase specs and implementation plans.
 - `*.pdf` at repo root — vendor manuals for the surrounding solar install (Growatt SPH inverters, SG48100 battery). Reference material; not related to the tracker firmware.
 
 ## Target hardware
@@ -23,7 +25,42 @@ There is no code yet. This directory is currently a **hardware reverse-engineeri
 
 1. **Buttons are read as a single analog/current-sensed input on MCU pin 9** — not 6 GPIOs. Series resistors: B1=12 kΩ, B2=51 kΩ, B3=27 kΩ, B4=15 kΩ, B5=62 kΩ, B6=none/0 Ω. ADC-sample and threshold; debounce *after* classification.
 2. **Limit switches are not on dedicated MCU pins.** They feed the ULN2003A inputs via diodes, pulling relay-driver inputs low at endstops. Vendor kit may ship without physical limit switches; pin 8 (2.7 kΩ to V_in, 10 kΩ + cap + diode to GND) is probably a **soft current-sensing** network for stall detection.
-3. **Pin 13 = P5.5, pin 19 = P3.4** (per STC15F2K60S2 SOP28 datasheet). Both NC on this PCB. Neither is a UART hardware alt-pin, but P3.4 has timer/PCA capability — preserve it for future use (e.g., wind-speed input capture).
+3. **Verified pin-to-port map (STC15F2K60S2 SOP28).** Authoritative — derived from the STC datasheet (pages 31–35) cross-referenced with `SolarTracker/Ecoworthy Board Description.txt`:
+
+   | Pin | Port | Function on this board |
+   |---|---|---|
+   | 1 | P2.7 | LCD D7 |
+   | 2 | P2.6 | LCD D6 |
+   | 3 | P1.0 / ADC0 | Sun sensor — East |
+   | 4 | P1.1 / ADC1 | Sun sensor — West |
+   | 5 | P1.2 / ADC2 | Sun sensor — South |
+   | 6 | P1.3 / ADC3 | Sun sensor — North |
+   | 7 | P1.4 / ADC4 | Wind-speed pulse |
+   | 8 | P1.5 / ADC5 | Stall current sense (soft) |
+   | 9 | P1.6 / ADC6 | Button analog bus |
+   | 10 | P1.7 / ADC7 | Piezo buzzer |
+   | 11 | **P5.4 / RST / MCLKO** | Relay 3 (North) — see quirk 8 |
+   | 12 | VCC | — |
+   | 13 | P5.5 | NC |
+   | 14 | GND | — |
+   | 15 | P3.0 / RxD / INT4 | Relay 2 (East) |
+   | 16 | P3.1 / TxD | Relay 4 (South) |
+   | 17 | **P3.2 / INT0** | IR receiver → repurposed as ESP bridge |
+   | 18 | P3.3 / INT1 | Relay 1 (West) |
+   | 19 | P3.4 / T0 / T1CLKO | NC (preserve for wind-speed input capture) |
+   | 20 | P3.5 / T1 / T0CLKO | LCD RS |
+   | 21 | P3.6 / INT2 / RxD_2 | LCD RW |
+   | 22 | P3.7 / INT3 / TxD_2 | LCD E |
+   | 23 | P2.0 | LCD D0 |
+   | 24 | P2.1 | LCD D1 |
+   | 25 | P2.2 | LCD D2 |
+   | 26 | P2.3 | LCD D3 |
+   | 27 | P2.4 | LCD D4 |
+   | 28 | P2.5 | LCD D5 |
+
+   **Port 0 is not exposed on SOP28** — every P0.x pin shows "—" in the datasheet's SOP28 column. Don't write to P0; it's a no-op.
+
+   **Port 3 is split-purpose on this board** — P3.0/P3.1 are relays E/S, P3.2 is the ESP bridge, P3.3 is relay W, P3.4 is NC, and P3.5–P3.7 are the LCD control bus (RS/RW/E). Never do byte-level writes to P3 except during relay-safe-boot before the LCD is initialized — use bit-level (sbit) ops everywhere else.
 4. **Relay-to-direction mapping** (via ULN2003A's input-to-output pin pairing — input N pairs with output 17−N):
    - MCU pin 11 → ULN in 2 → ULN out 15 → Relay 3 → "North" (nominal)
    - MCU pin 15 → ULN in 5 → ULN out 12 → Relay 2 → "East" (nominal)
@@ -36,8 +73,9 @@ There is no code yet. This directory is currently a **hardware reverse-engineeri
    - **E/W axis**: Relay 1 (pin 18) and Relay 2 (pin 15). Activating exactly one extends/retracts the actuator.
    - **N/S axis**: Relay 3 (pin 11) and Relay 4 (pin 16). Same pattern.
    - **Both relays on the same axis must never be active simultaneously** — depending on the H-bridge wiring this can short the 12 V supply or open-circuit the motor. Firmware MUST enforce mutual exclusion per axis as a hard invariant, not a best-effort.
-6. **IR receiver (pin 17) is vestigial** — the vendor never shipped a remote. **Repurposed as the Home Assistant bridge RX** (see below).
+6. **IR receiver (pin 17 / P3.2) is vestigial** — the vendor never shipped a remote. **Repurposed as the Home Assistant bridge** (see below). P3.2 is **INT0**, which is a hardware bonus: the start-bit falling edge of incoming UART traffic can fire the external interrupt, so software-UART RX doesn't need to poll.
 7. **Pins 15/16 are committed to relay drive AND are P3.0/P3.1 (UART1 default).** Pin 15 drives Relay 2 (East), pin 16 drives Relay 4 (South). Cannot use UART1 in default-pin configuration during normal operation without driving the E/S relays.
+8. **RELAY_N (pin 11) is on P5.4, which is the external RESET pin by default.** The board only works if the **ENRST** config bit is *disabled* — that demotes P5.4 from RST to a normal GPIO. Stock firmware obviously runs with ENRST off; our flashes must preserve that. Every flash with stcgal must explicitly set the option (CLI flag varies by stcgal version — typically `-o reset_pin=0` or similar; verify in `stcgal --help`). If the chip ever boots with ENRST on, the first relay coil-pickup pulse will reset the MCU mid-tracking — symptom is "STC reboots every time it tries to move north."
 
 ## Home Assistant bridge: ESP-01S over pin 17 (single wire)
 
@@ -51,7 +89,7 @@ ESP GPIO3 (RX) ─[BSS138 M2]┤── 10kΩ ╯ pull-ups (in breakout's R-pak)
                           │
                           │ tied together on 5V side of breakout
                           │
-                          └──── single wire ──── IR receiver signal leg ──── STC pin 17 (P3.5)
+                          └──── single wire ──── IR receiver signal leg ──── STC pin 17 (P3.2 / INT0)
                           
                           GND ── breakout GND ── tracker GND
 ```
@@ -74,14 +112,15 @@ Each was considered and ruled out. Don't re-litigate without new information:
 ### STC firmware setup
 
 ```c
-// Configure P3.5 (pin 17) as open-drain
-P3M0 |= (1 << 5);   // 11 = open-drain mode
-P3M1 |= (1 << 5);
-P3   |= (1 << 5);   // release line (pulled HIGH by breakout's pull-up)
+// Configure P3.2 (pin 17) as open-drain
+P3M0 |= (1 << 2);   // 11 = open-drain mode
+P3M1 |= (1 << 2);
+P3   |= (1 << 2);   // release line (pulled HIGH by breakout's pull-up)
 ```
 
-- **Software UART** on P3.5 at **9600 baud** (push to 38400 if needed; 5 kΩ effective pull-up + trace capacitance limits the practical ceiling well below 115200).
-- TX a "0": drive P3.5 LOW for one bit time. TX a "1": release (write 1) for one bit time. RX: sample mid-bit.
+- **Software UART** on P3.2 at **9600 baud** (push to 38400 if needed; 5 kΩ effective pull-up + trace capacitance limits the practical ceiling well below 115200).
+- TX a "0": drive P3.2 LOW for one bit time. TX a "1": release (write 1) for one bit time. RX: sample mid-bit.
+- **RX architecture**: P3.2 is INT0. Enable INT0 on falling edge (IT0=1, EX0=1); the ISR detects the start bit and either kicks off a bit-sampling timer or runs the receive state machine directly. This is cheaper than polling and lets the main loop continue LCD/sensor work.
 
 ### Protocol: magic-prefix framed half-duplex, ESP as master
 
@@ -121,12 +160,18 @@ Rule of thumb: a sub-millisecond pulse on a relay drive line is well below the m
 Before committing firmware to hardware:
 
 1. **LM2596 ripple on analog inputs.** 150 kHz switching may show up on sun-sensor ADC readings as ~10–30 mV fuzz. Add a 1 kΩ + 100 nF RC filter on each sensor line if differential readings need precision.
-2. **Pin 17 idle state with IR receiver in place.** Some IR receiver modules actively pull the signal line high or low at idle. Verify with a multimeter that pin 17 is high-impedance enough for the breakout's pull-up to dominate.
+2. **Pin 17 (P3.2) idle state with IR receiver in place.** Some IR receiver modules actively pull the signal line high or low at idle. Verify with a multimeter that pin 17 is high-impedance enough for the breakout's pull-up to dominate. Decide whether the IR receiver stays populated (then its output is on the line) or gets desoldered.
 3. **ESP-01S flash size.** Run `esptool.py flash_id` on the specific module before committing to the OTA path.
 4. **Breakout's TX/RX pull-up parallel resistance.** Assumed 10 kΩ each → 5 kΩ effective when tied. Measure with a multimeter on the actual breakout to confirm the values aren't 4.7 kΩ or 22 kΩ (some clones vary).
+5. **P5 bit-addressability on STC15F2K60S2.** Classic 8051 makes any SFR at an address-mod-8 boundary bit-addressable, and P5 is at 0xC8 (boundary). But STC datasheets are not uniformly explicit about extending bit-addressability to P4/P5 on every variant. If `RELAY_N = 1` (an sbit write on P5.4) doesn't physically wiggle pin 11, fall back to `P5 |= 0x10` byte-write macros in `board.h`. Verified working in Task 6 — sbit on P5.4 drives correctly.
+
+## Firmware gotchas
+
+- **STC15 port-mode SFR ordering is M1-then-M0, not M0-then-M1.** The lower-numbered address is P*M1, the higher is P*M0 (e.g. P3M1=0xB1, P3M0=0xB2). Easy mistake: write P*M0 in the natural "M0 comes first" order and silently configure every push-pull output as a high-impedance input (mode 10 instead of mode 01). Symptom is "code looks fine, asm looks fine, but pin won't drive" — incidental external loads (piezo capacitance, ULN2003A internal pull-downs) make the chip *look* OK while not actually driving anything. The `include/stc15f2k60s2.h` header now has these in datasheet order with a comment.
+- **The piezo buzzer is active-LOW.** `BUZZER = 0` (pin 10 / P1.7 LOW) energizes the buzzer; `BUZZER = 1` silences it. The board wires the piezo between the 5 V rail and pin 10, so the MCU is the sink-side switch. The original reverse-engineering notes only said "Piezo buzzer" without polarity — verified during Phase 0 bring-up.
 
 ## When extending this project
 
-- Re-read `Ecoworthy Board Description.txt` end-to-end before any firmware work. Several pins still have "unknown function" notes that should be resolved with a multimeter, not assumed.
-- If adding code, create `SolarTracker/firmware/` for the STC side and `SolarTracker/esphome/` for the ESP-01S YAML. Document build/flash commands here once they exist (SDCC + stcgal for the STC; ESPHome CLI for the ESP).
+- The verified pin-to-port map (quirk 3 above) is the single source of truth for SOP28 pin assignments. `Ecoworthy Board Description.txt` is still authoritative for what each pin connects to *on the PCB*, but for STC15 port identity, trust the table.
+- STC firmware lives in `EcoWorthyFirmware/` (SDCC + stcgal). The ESP-01S YAML will live in `EcoWorthyFirmware/esphome/` when Phase 2+ starts. Build/flash commands are documented in `EcoWorthyFirmware/README.md`.
 - The bridge design is finalized — don't redesign without new constraints. If the constraint changes (e.g., relays replaced, enclosure changes), the rejected-alternatives section above gives you the tree of options that were considered.
