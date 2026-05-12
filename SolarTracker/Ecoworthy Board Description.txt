@@ -1,0 +1,82 @@
+Solar dual axis tracker custom firmware design description
+
+Based on an STC 15F2K60S2 (SOP28)
+
+Programming header that connects to pins 15 and 16
+
+Outputs:
+1602A screen
+Piezo buzzer
+uln2003a darlington transistore that drives 4 relays, those relays trigger provide 12v two linera actuators W/E out, and N/S out.
+
+Inputs
+6 buttons, Set (B1), Quit(B2), North (B5), South (B6), East (B4), and West (B3)
+IR sensor, unknown function, looks like for a remote control the vendor never developed.
+wind speed sensor
+Sun intensity sensor
+E,W,S,N limit switches (no limit switches provided with kit? maybe soft sensing current draw?) - limit switches go to diodes that would be wired to pull the inputs to uln2003a down.
+
+STC 15F pinout
+
+1 - D7 on 1602A
+2 - D6 on 1602A
+3 - Solar Sensor - East
+4 - Solar Sensor - West
+5 - Solar Sensor - South
+6 - Solar Sensor - North
+7 - Wind Speed Sensor - Pulsed input
+8 - Goes through a 2702 resistor to VIn (12v), maybe current sensing? on the trace to that 2702 resisitor there is a 1002 resistor, unknown cap, and diode to the ground plane.
+9 - Current Sensing from buttons, each button has a different resistor in series back to the microcontroller
+10 - Piezo buzzer
+11 - Drives pin 2 on the uln2003a
+12 - VCC - 5V
+13 - Not connected?
+14 - GND
+
+15 - Drives pin 5 on the uln2003a
+16 - Drives pin 4 on the uln2003a
+17 - IR Sensor
+18 - Drives pin 1 on the uln2003a
+19 - Not connected?
+20 - RS on 1602A
+21 - RW on 1602A
+22 - E on 1602A
+23 - D0 on 1602A
+24 - D1 on 1602A
+25 - D2 on 1602A
+26 - D3 on 1602A
+27 - D4 on 1602A
+28 - D5 on 1602A
+
+uln2003a pinout:
+1 - Pin 18 on the 15F
+2 - Pin 11 on the 15F
+3
+4 - Pin 16 on the 15F
+5 - Pin 15 on the 15F 
+6
+7
+8 - GND
+
+9 - VCC
+10
+11
+12 - Relay 2
+13 - Relay 4
+14 - 
+15 - Relay 3
+16 - Relay 1
+
+
+Relay 1 - West
+Relay 2 - East
+Relay 3 - North
+Relay 4 - South
+
+Button resistor size:
+B1 - 1203
+B2 - 5102
+B3 - 2702
+B4 - 1502
+B5 - 6201
+B6 - No resistor?
