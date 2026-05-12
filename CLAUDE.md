@@ -23,7 +23,21 @@ Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker
 
 ## Non-obvious hardware quirks
 
-1. **Buttons are read as a single analog/current-sensed input on MCU pin 9** — not 6 GPIOs. Series resistors: B1=12 kΩ, B2=51 kΩ, B3=27 kΩ, B4=15 kΩ, B5=62 kΩ, B6=none/0 Ω. ADC-sample and threshold; debounce *after* classification.
+1. **Buttons are read as a single analog input on MCU pin 9 (P1.6 / ADC6)** — not 6 GPIOs. The bus is pulled to GND through ~27 kΩ; each button switches the bus to Vcc through its own series resistor. Pressing produces a voltage divider; the resulting ADC value identifies the button.
+
+   Verified series resistors (4-digit SMD codes from the board):
+
+   | Button | Code | Series resistor | Empirical ADC reading |
+   |---|---|---|---|
+   | (idle) | — | — | 0 |
+   | B1 SET | 1203 | 120 kΩ | 188 |
+   | B2 QUIT | 5102 | 51 kΩ | 356 |
+   | B3 WEST | 2702 | 27 kΩ | 517 |
+   | B4 EAST | 1502 | 15 kΩ | 662 |
+   | B5 NORTH | 6201 | 6.2 kΩ | 835 |
+   | B6 SOUTH | — | 0 Ω | 1023 |
+
+   Gap between adjacent button readings is ~145–188 ADC counts — well above noise floor. Classify with midpoint thresholds; debounce *after* classification. The vendor's 120 kΩ and 6.2 kΩ values came from precision 4-digit SMD codes (3 significant digits + 1 exponent), which earlier reverse-engineering misread as 12 kΩ / 62 kΩ — fixed in Phase 1.
 2. **Limit switches are not on dedicated MCU pins.** They feed the ULN2003A inputs via diodes, pulling relay-driver inputs low at endstops. Vendor kit may ship without physical limit switches; pin 8 (2.7 kΩ to V_in, 10 kΩ + cap + diode to GND) is probably a **soft current-sensing** network for stall detection.
 3. **Verified pin-to-port map (STC15F2K60S2 SOP28).** Authoritative — derived from the STC datasheet (pages 31–35) cross-referenced with `SolarTracker/Ecoworthy Board Description.txt`:
 

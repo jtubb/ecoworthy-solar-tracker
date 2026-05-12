@@ -47,6 +47,13 @@ __sfr __at (0xCA) P5M0;
 
 /* ---- Clock / power ---- */
 __sfr __at (0x8E) AUXR;       /* timer-clock / UART / EXTRAM */
+__sfr __at (0x97) CLK_DIV;    /* also PCON2; bit 5 = ADRJ (ADC right-justify) */
+
+/* ---- ADC (10-bit SAR, 8 channels on P1) ---- */
+__sfr __at (0x9D) P1ASF;      /* per-bit analog-function enable for P1 */
+__sfr __at (0xBC) ADC_CONTR;  /* power/speed/flag/start/channel */
+__sfr __at (0xBD) ADC_RES;    /* result high byte */
+__sfr __at (0xBE) ADC_RESL;   /* result low byte */
 
 /* ---- Timer 0 (used later for software-UART bit timing) ---- */
 __sfr __at (0x88) TCON;
