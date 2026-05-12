@@ -1,0 +1,21 @@
+# Build artifacts
+EcoWorthyFirmware/build/
+*.ihx
+*.hex
+*.lst
+*.lk
+*.map
+*.mem
+*.rel
+*.rst
+*.sym
+*.asm
+*.adb
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
