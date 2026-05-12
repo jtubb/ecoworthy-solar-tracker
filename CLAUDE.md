@@ -83,10 +83,24 @@ Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker
 
    **Cardinal-direction labels are the vendor's nominal intent, not ground truth.** Actuator mounting orientation and wire polarity are installer-dependent. Firmware must treat these as axis-relative directions (`+axis`/`-axis`) and resolve true compass mapping via a calibration step. See "H-bridge structure" below.
 
-5. **H-bridge structure.** Two physical actuators (one per axis), four relays, two relays per axis forming an H-bridge that selects forward/reverse polarity:
-   - **E/W axis**: Relay 1 (pin 18) and Relay 2 (pin 15). Activating exactly one extends/retracts the actuator.
-   - **N/S axis**: Relay 3 (pin 11) and Relay 4 (pin 16). Same pattern.
-   - **Both relays on the same axis must never be active simultaneously** — depending on the H-bridge wiring this can short the 12 V supply or open-circuit the motor. Firmware MUST enforce mutual exclusion per axis as a hard invariant, not a best-effort.
+5. **H-bridge structure — empirically determined in Phase 2A.** Two physical actuators, four relays, two relays per axis. **The pairing does NOT follow the intuitive cardinal grouping.** Verified by manual button testing:
+   - **N/S axis (tilts the panel)**: Relay 3 = `RELAY_N` (extends) + Relay 1 = `RELAY_W` (retracts).
+   - **E/W axis (rotates the panel)**: Relay 4 = `RELAY_S` (extends) + Relay 2 = `RELAY_E` (retracts).
+
+   The cardinal relay *labels* are misleading — `N+W` are H-bridge mates, and `S+E` are H-bridge mates. Either the vendor's labeling reflects panel-facing direction (not axis pairing), or the installer wired the actuators in a non-standard way. The empirical pairing is what matters.
+
+   **Mutex pairs (hard invariant)**: `{RELAY_N, RELAY_W}` and `{RELAY_S, RELAY_E}`. Activating both relays of the same pair shorts the 12 V supply through both contacts. Firmware MUST enforce this — see `set_axis_ns()` and `set_axis_ew()` in `main.c`.
+
+   **Button-to-relay mapping** (firmware re-routes for cardinal UX) — verified in Phase 2A bench testing:
+
+   | Button | Axis | Actuator action | Panel motion | Relay |
+   |---|---|---|---|---|
+   | N | N/S (tilt) | extend | tilt north | `RELAY_N` |
+   | S | N/S (tilt) | retract | tilt south | `RELAY_W` |
+   | E | E/W (rotate) | extend | rotate east | `RELAY_S` |
+   | W | E/W (rotate) | retract | rotate west | `RELAY_E` |
+
+   So pressing S routes through to `RELAY_W` and pressing E routes through to `RELAY_S` — the button label and relay label don't align, but the panel motion matches the button label. **Convention:** extending an actuator always moves the panel toward N or E; retracting always moves toward S or W. This is consistent across both axes on this installation.
 6. **IR receiver (pin 17 / P3.2) is vestigial** — the vendor never shipped a remote. **Repurposed as the Home Assistant bridge** (see below). P3.2 is **INT0**, which is a hardware bonus: the start-bit falling edge of incoming UART traffic can fire the external interrupt, so software-UART RX doesn't need to poll.
 7. **Pins 15/16 are committed to relay drive AND are P3.0/P3.1 (UART1 default).** Pin 15 drives Relay 2 (East), pin 16 drives Relay 4 (South). Cannot use UART1 in default-pin configuration during normal operation without driving the E/S relays.
 8. **RELAY_N (pin 11) is on P5.4, which is the external RESET pin by default.** The board only works if the **ENRST** config bit is *disabled* — that demotes P5.4 from RST to a normal GPIO. Stock firmware obviously runs with ENRST off; our flashes must preserve that. Every flash with stcgal must explicitly set the option (CLI flag varies by stcgal version — typically `-o reset_pin=0` or similar; verify in `stcgal --help`). If the chip ever boots with ENRST on, the first relay coil-pickup pulse will reset the MCU mid-tracking — symptom is "STC reboots every time it tries to move north."
@@ -178,6 +192,15 @@ Before committing firmware to hardware:
 3. **ESP-01S flash size.** Run `esptool.py flash_id` on the specific module before committing to the OTA path.
 4. **Breakout's TX/RX pull-up parallel resistance.** Assumed 10 kΩ each → 5 kΩ effective when tied. Measure with a multimeter on the actual breakout to confirm the values aren't 4.7 kΩ or 22 kΩ (some clones vary).
 5. **P5 bit-addressability on STC15F2K60S2.** Classic 8051 makes any SFR at an address-mod-8 boundary bit-addressable, and P5 is at 0xC8 (boundary). But STC datasheets are not uniformly explicit about extending bit-addressability to P4/P5 on every variant. If `RELAY_N = 1` (an sbit write on P5.4) doesn't physically wiggle pin 11, fall back to `P5 |= 0x10` byte-write macros in `board.h`. Verified working in Task 6 — sbit on P5.4 drives correctly.
+6. **Stall-current sense (pin 8 / P1.5 / ADC5) — partial characterization from Phase 2A.** The circuit is a 27 kΩ + 10 kΩ divider with a filter cap and ESD-clamp diode; the source rail appears to be 5 V (post-LM2596), not 12 V as the original notes suggested. With a constant-voltage 12 V bench supply, the firmware displays the channel as `dI` = (current sample) − (boot-time baseline), 8-sample averaged. Empirical motion classifier:
+
+   | `dI` value | State |
+   |---|---|
+   | 0 (drift around ±1) | no motion |
+   | < −5 (typically −5 to −10) | actuator in motion |
+   | −1 to −4 | actuator stalled at endstop |
+
+   The "stalled droops less than moving" behavior is counter-intuitive — a normal current shunt would show stall as the largest droop. The most likely explanation is that the circuit is sensing LM2596 transient response to relay-coil pickup current and not the actuator's 12 V motor current. This is good enough for "is the actuator moving" / "has it reached the endstop" detection, which is what tracking logic needs.
 
 ## Firmware gotchas
 
