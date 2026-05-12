@@ -68,33 +68,27 @@ static void lcd_print_u16_3d(unsigned int v) {
     lcd_putc('0' + (v % 10));
 }
 
-/* Signed 2-digit delta with explicit sign, e.g. "+05" or "-12". */
-static void lcd_print_delta(unsigned int current, unsigned int baseline) {
-    unsigned int abs_d;
-    if (current >= baseline) {
-        lcd_putc('+');
-        abs_d = current - baseline;
-    } else {
-        lcd_putc('-');
-        abs_d = baseline - current;
-    }
-    if (abs_d > 99) abs_d = 99;
-    lcd_putc('0' + (abs_d / 10));
-    lcd_putc('0' + (abs_d % 10));
-}
-
 /* ---- STC15 ADC ---- */
 #define ADC_POWER     0x80
 #define ADC_SPEED_540 0x00
 #define ADC_FLAG      0x10
 #define ADC_START     0x08
 
-#define ANALOG_PINS   ((1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 6))
+#define ANALOG_PINS   ((1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6))
 
 static void adc_init(void) {
     CLK_DIV |= (1 << 5);
     ADC_CONTR = ADC_POWER;
     delay_ms(1);
+}
+
+/* Convert a 10-bit ADC reading from the wind sensor (0-2V output,
+ * 0-50 m/s range, slope 25 m/s per volt) to m/s.  Math:
+ *     m/s = (ADC / 1023) * 5V * 25 = ADC * 125 / 1023
+ * Capped at 99 to keep the display 2-digit.  Realistic max is ~50. */
+static unsigned char wind_mps(unsigned int adc) {
+    unsigned long v = (unsigned long)adc * 125UL / 1023UL;
+    return (v > 99) ? 99 : (unsigned char)v;
 }
 
 static unsigned int adc_read(unsigned char channel) {
@@ -108,16 +102,6 @@ static unsigned int adc_read(unsigned char channel) {
     while (!(ADC_CONTR & ADC_FLAG)) { }
     ADC_CONTR &= ~ADC_FLAG;
     return ((unsigned int)(ADC_RES & 0x03) << 8) | ADC_RESL;
-}
-
-/* Average N samples to push noise floor down by sqrt(N). */
-static unsigned int adc_read_avg(unsigned char channel, unsigned char samples) {
-    unsigned long sum = 0;
-    unsigned char i;
-    for (i = 0; i < samples; i++) {
-        sum += adc_read(channel);
-    }
-    return (unsigned int)(sum / samples);
 }
 
 /* ---- Button decoder ---- */
@@ -191,8 +175,6 @@ static char ew_char(axis_state_t s) {
 }
 
 void main(void) {
-    unsigned int current_idle;
-
     /* Relay-safe boot. */
     P3 = 0x00;
     P5 &= ~(1 << 4);
@@ -214,17 +196,12 @@ void main(void) {
     lcd_init();
     adc_init();
 
-    /* Capture current-sense baseline with relays guaranteed off.
-     * 16-sample average for a stable starting reference. */
-    delay_ms(100);
-    current_idle = adc_read_avg(ADC_CH_STALL, 16);
-
     for (;;) {
         unsigned int sun_n = adc_read(ADC_CH_SUN_N);
         unsigned int sun_s = adc_read(ADC_CH_SUN_S);
         unsigned int sun_e = adc_read(ADC_CH_SUN_E);
         unsigned int sun_w = adc_read(ADC_CH_SUN_W);
-        unsigned int stall = adc_read_avg(ADC_CH_STALL, 8);
+        unsigned int wind  = adc_read(ADC_CH_WIND);
         unsigned int btn_v = adc_read(ADC_CH_BUTTONS);
         button_t b = button_classify(btn_v);
 
@@ -252,14 +229,18 @@ void main(void) {
         lcd_putc('E'); lcd_print_u16_3d(sun_e);
         lcd_putc('W'); lcd_print_u16_3d(sun_w);
 
-        /* Line 2: "dI=+99 NS=N EW=S"  -- delta current + axis states. */
-        lcd_goto(1, 0);
-        lcd_print("dI=");
-        lcd_print_delta(stall, current_idle);
-        lcd_print(" NS=");
-        lcd_putc(ns_char(ns_state));
-        lcd_print(" EW=");
-        lcd_putc(ew_char(ew_state));
+        /* Line 2: "NS=N EW=E Wnd=50"  -- axis states + wind speed (m/s). */
+        {
+            unsigned char mps = wind_mps(wind);
+            lcd_goto(1, 0);
+            lcd_print("NS=");
+            lcd_putc(ns_char(ns_state));
+            lcd_print(" EW=");
+            lcd_putc(ew_char(ew_state));
+            lcd_print(" Wnd=");
+            lcd_putc('0' + (mps / 10));
+            lcd_putc('0' + (mps % 10));
+        }
 
         delay_ms(50);
     }

@@ -39,7 +39,7 @@ Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker
 
    Gap between adjacent button readings is ~145–188 ADC counts — well above noise floor. Classify with midpoint thresholds; debounce *after* classification. The vendor's 120 kΩ and 6.2 kΩ values came from precision 4-digit SMD codes (3 significant digits + 1 exponent), which earlier reverse-engineering misread as 12 kΩ / 62 kΩ — fixed in Phase 1.
 2. **Limit switches are not on dedicated MCU pins.** They feed the ULN2003A inputs via diodes, pulling relay-driver inputs low at endstops. Vendor kit may ship without physical limit switches; pin 8 (2.7 kΩ to V_in, 10 kΩ + cap + diode to GND) is probably a **soft current-sensing** network for stall detection.
-3. **Verified pin-to-port map (STC15F2K60S2 SOP28).** Authoritative — derived from the STC datasheet (pages 31–35) cross-referenced with `SolarTracker/Ecoworthy Board Description.txt`:
+3. **Verified pin-to-port map (STC15F2K60S2 SOP28).** Authoritative — derived from the STC datasheet (pages 31–35) cross-referenced with `SolarTracker/Ecoworthy Board Description.txt`. **Note:** The description file says pin 7 is a "Pulsed input" wind sensor; the actual hardware delivered is an **analog** sensor with a 0–2 V output (verified by reading the part's label in Phase 2D). Description-file labels for ambiguous pins should be treated as guesses, not ground truth — confirm against physical hardware.
 
    | Pin | Port | Function on this board |
    |---|---|---|
@@ -49,7 +49,7 @@ Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker
    | 4 | P1.1 / ADC1 | Sun sensor — West |
    | 5 | P1.2 / ADC2 | Sun sensor — South |
    | 6 | P1.3 / ADC3 | Sun sensor — North |
-   | 7 | P1.4 / ADC4 | Wind-speed pulse |
+   | 7 | P1.4 / ADC4 | Wind-speed analog (0–2 V, 25 m/s per volt) |
    | 8 | P1.5 / ADC5 | Stall current sense (soft) |
    | 9 | P1.6 / ADC6 | Button analog bus |
    | 10 | P1.7 / ADC7 | Piezo buzzer |

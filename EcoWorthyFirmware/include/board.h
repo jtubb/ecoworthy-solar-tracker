@@ -52,7 +52,7 @@ __sbit __at (0xB7) LCD_E;     /* pin 22, P3.7 */
 #define ADC_CH_SUN_W      1   /* pin 4 */
 #define ADC_CH_SUN_S      2   /* pin 5 */
 #define ADC_CH_SUN_N      3   /* pin 6 */
-#define ADC_CH_WIND       4   /* pin 7  -- also P3.4-style timer/capture candidate */
+#define ADC_CH_WIND       4   /* pin 7  -- analog wind sensor, 0-2V (Vout * 25 = m/s) */
 #define ADC_CH_STALL      5   /* pin 8  -- soft current sense for stall detect */
 #define ADC_CH_BUTTONS    6   /* pin 9  -- resistor-ladder button bus */
 
