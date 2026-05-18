@@ -41,6 +41,7 @@ __sbit __at (0xB2) BRIDGE_IO;
  * Convenient: a whole-port write to P2 sets the entire data bus at once.
  */
 #define LCD_DATA  P2
+__sbit __at (0xB4) LCD_BL;    /* pin 19, P3.4 -- backlight, active-HIGH */
 __sbit __at (0xB5) LCD_RS;    /* pin 20, P3.5 */
 __sbit __at (0xB6) LCD_RW;    /* pin 21, P3.6 */
 __sbit __at (0xB7) LCD_E;     /* pin 22, P3.7 */

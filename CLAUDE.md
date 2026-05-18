@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker board, plus an ESPHome bridge to Home Assistant via an ESP-01S. **Phase 0 (toolchain bring-up) is complete:** SDCC + GNU Make + stcgal flashing works, the STC15F2K60S2 runs custom firmware that initializes the 1602A LCD and idles silently. Firmware lives in `EcoWorthyFirmware/` — see its `README.md` for build/flash commands.
+Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker board, plus an ESPHome bridge to Home Assistant via an ESP-01S. **Phases 0–2C are complete:** the STC15F2K60S2 runs a full custom tracker firmware — boot auto-zero, stall-to-stall calibration (max of extend/retract stroke, with extend stall-delay correction), relay-on-time position tracking, a menu UI (Track / Jog / Calibrate / Backlash / Settings / Version) with debounced resistor-ladder buttons and press-and-hold auto-repeat, EEPROM-persisted settings, differential sun-sensor pulse-tracking with per-axis duty-cycle limiting, and a wind storm interlock (park-to-horizontal + resettable dwell). The ESPHome bridge (Phase 3) is not yet started. Firmware lives in `EcoWorthyFirmware/` — see its `README.md` for build/flash commands.
+
+**Build note:** the project now requires `--stack-auto` (set in the Makefile). The state-machine + helper call graph exceeds SDCC's default 128-byte IRAM overlay budget; the reentrant model puts locals on the internal stack instead. Don't remove this flag without re-checking the DSEG overlay error.
 
 ## Layout
 
@@ -38,7 +40,7 @@ Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker
    | B6 SOUTH | — | 0 Ω | 1023 |
 
    Gap between adjacent button readings is ~145–188 ADC counts — well above noise floor. Classify with midpoint thresholds; debounce *after* classification. The vendor's 120 kΩ and 6.2 kΩ values came from precision 4-digit SMD codes (3 significant digits + 1 exponent), which earlier reverse-engineering misread as 12 kΩ / 62 kΩ — fixed in Phase 1.
-2. **Limit switches are not on dedicated MCU pins.** They feed the ULN2003A inputs via diodes, pulling relay-driver inputs low at endstops. Vendor kit may ship without physical limit switches; pin 8 (2.7 kΩ to V_in, 10 kΩ + cap + diode to GND) is probably a **soft current-sensing** network for stall detection.
+2. **Limit switches are not on dedicated MCU pins — they're a hardware safety net that bypasses firmware entirely.** The unused endstop contacts on the PCB feed ULN2003A inputs via diodes. If physical switches are wired to them, closing a switch pulls the corresponding relay-driver input LOW *regardless of what the MCU asserts*, mechanically cutting motor power at the limit. Vendor kit ships without populated switches because the supplied actuators have internal limit switches that perform the same job (open the motor circuit at endstop). For extra safety on a real install, wiring external switches to the unused PCB pads is essentially free — the firmware doesn't need to know about them. The pin 8 analog network (see quirk 6) is a **secondary** signal that detects motor activity / soft stall, not the primary endstop mechanism.
 3. **Verified pin-to-port map (STC15F2K60S2 SOP28).** Authoritative — derived from the STC datasheet (pages 31–35) cross-referenced with `SolarTracker/Ecoworthy Board Description.txt`. **Note:** The description file says pin 7 is a "Pulsed input" wind sensor; the actual hardware delivered is an **analog** sensor with a 0–2 V output (verified by reading the part's label in Phase 2D). Description-file labels for ambiguous pins should be treated as guesses, not ground truth — confirm against physical hardware.
 
    | Pin | Port | Function on this board |
@@ -61,7 +63,7 @@ Custom-firmware project for an off-the-shelf "Ecoworthy" dual-axis solar tracker
    | 16 | P3.1 / TxD | Relay 4 (South) |
    | 17 | **P3.2 / INT0** | IR receiver → repurposed as ESP bridge |
    | 18 | P3.3 / INT1 | Relay 1 (West) |
-   | 19 | P3.4 / T0 / T1CLKO | NC (preserve for wind-speed input capture) |
+   | 19 | P3.4 / T0 / T1CLKO | LCD backlight (active-HIGH, push-pull) |
    | 20 | P3.5 / T1 / T0CLKO | LCD RS |
    | 21 | P3.6 / INT2 / RxD_2 | LCD RW |
    | 22 | P3.7 / INT3 / TxD_2 | LCD E |
@@ -192,15 +194,29 @@ Before committing firmware to hardware:
 3. **ESP-01S flash size.** Run `esptool.py flash_id` on the specific module before committing to the OTA path.
 4. **Breakout's TX/RX pull-up parallel resistance.** Assumed 10 kΩ each → 5 kΩ effective when tied. Measure with a multimeter on the actual breakout to confirm the values aren't 4.7 kΩ or 22 kΩ (some clones vary).
 5. **P5 bit-addressability on STC15F2K60S2.** Classic 8051 makes any SFR at an address-mod-8 boundary bit-addressable, and P5 is at 0xC8 (boundary). But STC datasheets are not uniformly explicit about extending bit-addressability to P4/P5 on every variant. If `RELAY_N = 1` (an sbit write on P5.4) doesn't physically wiggle pin 11, fall back to `P5 |= 0x10` byte-write macros in `board.h`. Verified working in Task 6 — sbit on P5.4 drives correctly.
-6. **Stall-current sense (pin 8 / P1.5 / ADC5) — partial characterization from Phase 2A.** The circuit is a 27 kΩ + 10 kΩ divider with a filter cap and ESD-clamp diode; the source rail appears to be 5 V (post-LM2596), not 12 V as the original notes suggested. With a constant-voltage 12 V bench supply, the firmware displays the channel as `dI` = (current sample) − (boot-time baseline), 8-sample averaged. Empirical motion classifier:
+6. **Stall-current sense (pin 8 / P1.5 / ADC5) — fully characterized in Phase 2C.** Verified topology (measured on the board, supersedes earlier guesses):
 
-   | `dI` value | State |
-   |---|---|
-   | 0 (drift around ±1) | no motion |
-   | < −5 (typically −5 to −10) | actuator in motion |
-   | −1 to −4 | actuator stalled at endstop |
+   ```
+   12V_in ── 2.7kΩ ── pin 8 ── 3.0kΩ ── GND
+                       │
+                       ├── cap (~45 nF) ── GND
+                       │
+                       └── soft-knee Zener ── GND  (cathode on pin, V_z ≈ 1.2V, Z_z ≈ 77Ω)
+   ```
 
-   The "stalled droops less than moving" behavior is counter-intuitive — a normal current shunt would show stall as the largest droop. The most likely explanation is that the circuit is sensing LM2596 transient response to relay-coil pickup current and not the actuator's 12 V motor current. This is good enough for "is the actuator moving" / "has it reached the endstop" detection, which is what tracking logic needs.
+   It's a **rail-droop monitor**, not a current shunt. The divider's open-circuit voltage is 12 × 3.0/5.7 = 6.32V, but the Zener clamps the pin to ~1.2V (baseline ADC ~250). The Zener is intentionally **soft-knee** (Z_z ≈ 77Ω, vs. <20Ω for a hard Zener) so that bus-voltage droop is transmitted to the pin at the ratio Z_z / R1 ≈ 77/2700 ≈ **2.85% of bus droop**. The cap is a noise filter (~2.5 kHz corner) that rejects motor commutation noise; the Zener doubles as ADC over-voltage protection.
+
+   Firmware displays the channel as `dI` = `current_idle - sample`, 8-sample averaged. Empirical three-band classifier (`di_classify()` in `main.c`):
+
+   | `dI` value | Band | Meaning |
+   |---|---|---|
+   | 0..1 | IDLE | no motor current (or below the ~2-count ADC noise floor) |
+   | 2..4 | STALLED | residual current; motor stopped or limit switch open |
+   | ≥ 5 | MOVING | motor pulling load current, panel in motion |
+
+   **Bench vs. install signal magnitude.** On a stiff CV bench supply with short leads, motor-induced bus droop is small (~few hundred mV transient) and the signal is marginal (5–10 ADC counts during motion). On a real install with battery + lossy DC wiring (50–300 mΩ round-trip impedance), 1–3 V of droop is realistic under motor load → 30–85 ADC counts at the pin. **The same algorithm that's marginal on bench will be robust on the install.**
+
+   **Why stall reads near idle, not as the largest droop.** The supplied actuators have *internal* limit switches that mechanically **open** the motor circuit at the endstop. Current drops to zero → rail recovers → pin returns to (or near) baseline. At the *retract* endstop a small residual current path through the limit-switch-bypass diode produces the −1 to −4 count signature; at the *extend* endstop the circuit opens cleanly and dI returns to 0. The classifier uses a `saw_motion` gate so that "back to idle after seeing MOVING" is also accepted as stall.
 
 ## Firmware gotchas
 

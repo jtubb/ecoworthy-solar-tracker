@@ -11,7 +11,16 @@ INC     := include
 CFLAGS  := -mmcs51 \
            --std-sdcc11 \
            --opt-code-size \
+           --stack-auto \
+           --lib-path "C:/Program Files/SDCC/lib/small-stack-auto" \
            -I$(INC)
+# --stack-auto: reentrant calling convention -- function locals live on
+# the internal-RAM stack (~223 bytes available) instead of SDCC's
+# default fixed-overlay model.  The state machine + helper call graph
+# exceeds the 128-byte overlay budget; this removes that ceiling.
+# (--xstack was rejected: the bundled small-stack-auto libs aren't
+# built with it.)  Explicit --lib-path because SDCC didn't auto-resolve
+# the small-stack-auto lib dir on this Windows install.
 
 SOURCES := $(SRC)/main.c
 HEADERS := $(wildcard $(INC)/*.h)

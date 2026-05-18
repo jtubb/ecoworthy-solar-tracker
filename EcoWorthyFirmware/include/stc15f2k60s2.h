@@ -55,6 +55,18 @@ __sfr __at (0xBC) ADC_CONTR;  /* power/speed/flag/start/channel */
 __sfr __at (0xBD) ADC_RES;    /* result high byte */
 __sfr __at (0xBE) ADC_RESL;   /* result low byte */
 
+/* ---- IAP / EEPROM (1 KB of in-app-programmable flash) ----
+ * Byte-program can only clear bits (1->0); to write any pattern,
+ * sector-erase first (sets all bytes in sector to 0xFF), then program.
+ * Sector size = 512 bytes.  Each op requires the 0x5A,0xA5 trigger pair.
+ */
+__sfr __at (0xC2) IAP_DATA;
+__sfr __at (0xC3) IAP_ADDRH;
+__sfr __at (0xC4) IAP_ADDRL;
+__sfr __at (0xC5) IAP_CMD;
+__sfr __at (0xC6) IAP_TRIG;
+__sfr __at (0xC7) IAP_CONTR;
+
 /* ---- Timer 0 (used later for software-UART bit timing) ---- */
 __sfr __at (0x88) TCON;
 __sfr __at (0x89) TMOD;

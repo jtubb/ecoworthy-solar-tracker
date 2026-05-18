@@ -39,6 +39,18 @@ static void lcd_print(const char *s) {
     while (*s) lcd_putc(*s++);
 }
 
+static void lcd_print_padded(const char *s, unsigned char width) {
+    unsigned char n = 0;
+    while (*s && n < width) {
+        lcd_putc(*s++);
+        n++;
+    }
+    while (n < width) {
+        lcd_putc(' ');
+        n++;
+    }
+}
+
 static void lcd_init(void) {
     delay_ms(50);
     LCD_RS = 0;
@@ -61,11 +73,201 @@ static void lcd_goto(unsigned char row, unsigned char col) {
     lcd_cmd(0x80 | addr);
 }
 
-static void lcd_print_u16_3d(unsigned int v) {
-    if (v > 999) v = 999;
-    lcd_putc('0' + (v / 100));
-    lcd_putc('0' + ((v / 10) % 10));
-    lcd_putc('0' + (v % 10));
+static void lcd_clear(void) {
+    lcd_cmd(0x01);
+    delay_ms(2);
+}
+
+/* ---- 1 kHz tick timer for accurate elapsed-time tracking ----
+ * Timer 0 in mode 1 (16-bit, manual reload) at 1 ms.  Increments a
+ * 32-bit ms_count.  Used by millis() for stroke timing, stall detection
+ * window, duty-cycle decay, etc.  Loop-iteration approximations remain
+ * fine for non-critical waits (delay_ms above).
+ */
+static volatile unsigned long ms_count = 0;
+
+#define T0_RELOAD_LO ((unsigned char)((65536 - 22118) & 0xFF))
+#define T0_RELOAD_HI ((unsigned char)((65536 - 22118) >> 8))
+
+void timer0_isr(void) __interrupt(1) {
+    TL0 = T0_RELOAD_LO;
+    TH0 = T0_RELOAD_HI;
+    ms_count++;
+}
+
+static void timer0_init(void) {
+    AUXR |= (1 << 7);               /* T0 in 1T mode */
+    TMOD = (TMOD & 0xF0) | 0x01;    /* T0 mode 1 (16-bit) */
+    TL0 = T0_RELOAD_LO;
+    TH0 = T0_RELOAD_HI;
+    ET0 = 1;
+    EA = 1;
+    TR0 = 1;
+}
+
+/* Atomic 32-bit read against the ISR. */
+static unsigned long millis(void) {
+    unsigned long m;
+    EA = 0;
+    m = ms_count;
+    EA = 1;
+    return m;
+}
+
+/* ---- IAP / EEPROM ---- */
+#define IAP_ENABLE_22MHZ  0x83
+#define IAP_CMD_READ      0x01
+#define IAP_CMD_PROGRAM   0x02
+#define IAP_CMD_ERASE     0x03
+
+#define EEPROM_BASE       0x0000
+#define CONFIG_MAGIC_0    0xC0
+#define CONFIG_MAGIC_1    0xDE
+
+static void iap_idle(void) {
+    IAP_CONTR = 0;
+    IAP_CMD = 0;
+    IAP_TRIG = 0;
+    IAP_ADDRH = 0xFF;
+    IAP_ADDRL = 0xFF;
+}
+
+static unsigned char iap_read_byte(unsigned int addr) {
+    unsigned char dat;
+    EA = 0;
+    IAP_CONTR = IAP_ENABLE_22MHZ;
+    IAP_CMD = IAP_CMD_READ;
+    IAP_ADDRH = addr >> 8;
+    IAP_ADDRL = addr & 0xFF;
+    IAP_TRIG = 0x5A;
+    IAP_TRIG = 0xA5;
+    __asm
+        nop
+    __endasm;
+    dat = IAP_DATA;
+    iap_idle();
+    EA = 1;
+    return dat;
+}
+
+static void iap_program_byte(unsigned int addr, unsigned char dat) {
+    EA = 0;
+    IAP_CONTR = IAP_ENABLE_22MHZ;
+    IAP_CMD = IAP_CMD_PROGRAM;
+    IAP_ADDRH = addr >> 8;
+    IAP_ADDRL = addr & 0xFF;
+    IAP_DATA = dat;
+    IAP_TRIG = 0x5A;
+    IAP_TRIG = 0xA5;
+    __asm
+        nop
+    __endasm;
+    iap_idle();
+    EA = 1;
+}
+
+static void iap_erase_sector(unsigned int addr) {
+    EA = 0;
+    IAP_CONTR = IAP_ENABLE_22MHZ;
+    IAP_CMD = IAP_CMD_ERASE;
+    IAP_ADDRH = addr >> 8;
+    IAP_ADDRL = addr & 0xFF;
+    IAP_TRIG = 0x5A;
+    IAP_TRIG = 0xA5;
+    __asm
+        nop
+    __endasm;
+    iap_idle();
+    EA = 1;
+}
+
+static unsigned char config_is_valid(void) {
+    return (iap_read_byte(EEPROM_BASE + 0) == CONFIG_MAGIC_0 &&
+            iap_read_byte(EEPROM_BASE + 1) == CONFIG_MAGIC_1);
+}
+
+/* Config struct layout in EEPROM (little-endian 16-bit):
+ *   0..1  : magic (0xC0 0xDE)
+ *   2..3  : ns_stroke_ms (lo, hi)
+ *   4..5  : ew_stroke_ms (lo, hi)
+ *   6     : horiz_ns_pct (0..100; default 50)
+ *   7     : horiz_ew_pct (0..100; default 50)
+ *   8     : wind_storm_mps -- enter storm park above this wind speed
+ *   9     : wind_release_mps -- release storm dwell below this speed
+ *   10    : storm_dwell_min -- minutes wind must stay below release
+ *   11    : track_thresh -- sun differential ADC counts to trigger a move
+ */
+static unsigned int ns_stroke_ms = 0;
+static unsigned int ew_stroke_ms = 0;
+static unsigned char horiz_ns_pct = 50;
+static unsigned char horiz_ew_pct = 50;
+static unsigned char wind_storm_mps   = 15;
+static unsigned char wind_release_mps = 10;
+static unsigned char storm_dwell_min  = 10;
+static unsigned char track_thresh     = 3;
+
+/* Setting range bounds.  Used by ST_SETTINGS_EDIT for clamping and
+ * by config_load() for sanity-checking unprogrammed EEPROM bytes. */
+#define WIND_STORM_MIN    5
+#define WIND_STORM_MAX   30
+#define WIND_RELEASE_MIN  0
+#define WIND_RELEASE_MAX 20
+#define DWELL_MIN_MIN     1
+#define DWELL_MIN_MAX    60
+#define TRACK_THRESH_MIN  1
+#define TRACK_THRESH_MAX 99
+
+static unsigned int iap_read_u16(unsigned int addr) {
+    unsigned int lo = iap_read_byte(addr);
+    unsigned int hi = iap_read_byte(addr + 1);
+    return (hi << 8) | lo;
+}
+
+static void config_load(void) {
+    if (!config_is_valid()) return;
+    ns_stroke_ms = iap_read_u16(EEPROM_BASE + 2);
+    ew_stroke_ms = iap_read_u16(EEPROM_BASE + 4);
+    horiz_ns_pct = iap_read_byte(EEPROM_BASE + 6);
+    horiz_ew_pct = iap_read_byte(EEPROM_BASE + 7);
+    wind_storm_mps   = iap_read_byte(EEPROM_BASE + 8);
+    wind_release_mps = iap_read_byte(EEPROM_BASE + 9);
+    storm_dwell_min  = iap_read_byte(EEPROM_BASE + 10);
+    track_thresh     = iap_read_byte(EEPROM_BASE + 11);
+    if (horiz_ns_pct > 100) horiz_ns_pct = 50;
+    if (horiz_ew_pct > 100) horiz_ew_pct = 50;
+    /* Reject unprogrammed (0xFF) and out-of-range; revert to defaults. */
+    if (wind_storm_mps < WIND_STORM_MIN || wind_storm_mps > WIND_STORM_MAX)
+        wind_storm_mps = 15;
+    if (wind_release_mps > WIND_RELEASE_MAX)
+        wind_release_mps = 10;
+    if (storm_dwell_min < DWELL_MIN_MIN || storm_dwell_min > DWELL_MIN_MAX)
+        storm_dwell_min = 10;
+    if (track_thresh < TRACK_THRESH_MIN || track_thresh > TRACK_THRESH_MAX)
+        track_thresh = 3;
+    /* Invariant: release threshold must be strictly less than storm threshold. */
+    if (wind_release_mps >= wind_storm_mps)
+        wind_release_mps = (wind_storm_mps > 0) ? wind_storm_mps - 1 : 0;
+}
+
+static void config_save(void) {
+    /* Re-apply invariant before persisting -- catches the case where
+     * the user just edited release up past storm via the menu. */
+    if (wind_release_mps >= wind_storm_mps)
+        wind_release_mps = (wind_storm_mps > 0) ? wind_storm_mps - 1 : 0;
+
+    iap_erase_sector(EEPROM_BASE);
+    iap_program_byte(EEPROM_BASE + 0, CONFIG_MAGIC_0);
+    iap_program_byte(EEPROM_BASE + 1, CONFIG_MAGIC_1);
+    iap_program_byte(EEPROM_BASE + 2, ns_stroke_ms & 0xFF);
+    iap_program_byte(EEPROM_BASE + 3, ns_stroke_ms >> 8);
+    iap_program_byte(EEPROM_BASE + 4, ew_stroke_ms & 0xFF);
+    iap_program_byte(EEPROM_BASE + 5, ew_stroke_ms >> 8);
+    iap_program_byte(EEPROM_BASE + 6, horiz_ns_pct);
+    iap_program_byte(EEPROM_BASE + 7, horiz_ew_pct);
+    iap_program_byte(EEPROM_BASE + 8, wind_storm_mps);
+    iap_program_byte(EEPROM_BASE + 9, wind_release_mps);
+    iap_program_byte(EEPROM_BASE + 10, storm_dwell_min);
+    iap_program_byte(EEPROM_BASE + 11, track_thresh);
 }
 
 /* ---- STC15 ADC ---- */
@@ -82,15 +284,6 @@ static void adc_init(void) {
     delay_ms(1);
 }
 
-/* Convert a 10-bit ADC reading from the wind sensor (0-2V output,
- * 0-50 m/s range, slope 25 m/s per volt) to m/s.  Math:
- *     m/s = (ADC / 1023) * 5V * 25 = ADC * 125 / 1023
- * Capped at 99 to keep the display 2-digit.  Realistic max is ~50. */
-static unsigned char wind_mps(unsigned int adc) {
-    unsigned long v = (unsigned long)adc * 125UL / 1023UL;
-    return (v > 99) ? 99 : (unsigned char)v;
-}
-
 static unsigned int adc_read(unsigned char channel) {
     ADC_CONTR = ADC_POWER | ADC_SPEED_540 | ADC_START | (channel & 0x07);
     __asm
@@ -102,6 +295,21 @@ static unsigned int adc_read(unsigned char channel) {
     while (!(ADC_CONTR & ADC_FLAG)) { }
     ADC_CONTR &= ~ADC_FLAG;
     return ((unsigned int)(ADC_RES & 0x03) << 8) | ADC_RESL;
+}
+
+/* Average `samples` ADC reads; pushes noise floor down by sqrt(samples). */
+static unsigned int adc_read_avg(unsigned char channel, unsigned char samples) {
+    unsigned long sum = 0;
+    unsigned char i;
+    for (i = 0; i < samples; i++) {
+        sum += adc_read(channel);
+    }
+    return (unsigned int)(sum / samples);
+}
+
+static unsigned char wind_mps(unsigned int adc) {
+    unsigned long v = (unsigned long)adc * 125UL / 1023UL;
+    return (v > 99) ? 99 : (unsigned char)v;
 }
 
 /* ---- Button decoder ---- */
@@ -119,24 +327,20 @@ static button_t button_classify(unsigned int adc) {
     return BTN_SOUTH;
 }
 
-/* ---- Axis state machine ----
- * Empirically determined H-bridge pairing on this board (Phase 2A test):
- *   N/S axis (tilt actuator):  RELAY_N (extend) + RELAY_W (retract)
- *   E/W axis (rotate actuator): RELAY_S (extend) + RELAY_E (retract)
- *
- * Note: cardinal button labels do NOT match cardinal axis pairing on
- * this installation -- pressing N+W controls the SAME actuator, as does
- * S+E.  Mutex must protect these real pairs, not the intuitive {N,S}
- * and {E,W} groupings.
+/* ---- Axis state machine (carries over from Phase 2A) ----
+ * Physical H-bridge pairs:
+ *   N/S axis (tilt):  RELAY_N (FWD/extend) + RELAY_W (REV/retract)
+ *   E/W axis (rotate): RELAY_S (FWD/extend) + RELAY_E (REV/retract)
+ * `set_axis_*()` enforce mutex with a 10 ms release delay on reversal.
  */
 typedef enum {
     AXIS_OFF = 0,
-    AXIS_FWD,    /* extends: N for tilt, S for rotate */
-    AXIS_REV     /* retracts: W for tilt, E for rotate */
+    AXIS_FWD,
+    AXIS_REV
 } axis_state_t;
 
-static axis_state_t ns_state = AXIS_OFF;   /* tilt: RELAY_N (FWD), RELAY_W (REV) */
-static axis_state_t ew_state = AXIS_OFF;   /* rotate: RELAY_S (FWD), RELAY_E (REV) */
+static axis_state_t ns_state = AXIS_OFF;
+static axis_state_t ew_state = AXIS_OFF;
 
 static void set_axis_ns(axis_state_t target) {
     if (target == ns_state) return;
@@ -162,7 +366,6 @@ static void set_axis_ew(axis_state_t target) {
     ew_state = target;
 }
 
-/* Active button letter, '-' if axis is off. */
 static char ns_char(axis_state_t s) {
     if (s == AXIS_FWD) return 'N';
     if (s == AXIS_REV) return 'S';
@@ -174,14 +377,1072 @@ static char ew_char(axis_state_t s) {
     return '-';
 }
 
+/* ---- Position tracking ----
+ * pos_ms is the integrated "FWD time minus REV time since last zero",
+ * saturated to [0, stroke_ms].  0 = retract endstop, stroke_ms = extend.
+ *
+ * Backlash compensation: the position integrator supports per-axis
+ * "skip first N ms of FWD after a REV" via `backlash_ms`.  Set to 0 on
+ * this build -- the backlash test (Menu -> Backlash) showed gear slack
+ * below 20 ms, which is negligible for solar tracking accuracy and
+ * gets absorbed by the saturation clamp at stroke endpoints.  If a
+ * future actuator has measurable backlash, raise this constant.
+ */
+#define EXTEND_BACKLASH_MS  0U
+
+/* __xdata to keep these file-scope statics out of the DSEG overlay
+ * pool -- 14 bytes there matters at the 128-byte budget limit. */
+static __xdata unsigned int ns_pos_ms = 0;
+static __xdata unsigned int ew_pos_ms = 0;
+static __xdata unsigned int ns_backlash_ms = EXTEND_BACKLASH_MS;
+static __xdata unsigned int ew_backlash_ms = EXTEND_BACKLASH_MS;
+static __xdata axis_state_t ns_pos_prev = AXIS_OFF;
+static __xdata axis_state_t ew_pos_prev = AXIS_OFF;
+static __xdata unsigned long pos_last_tick_ms = 0;
+
+/* ---- Duty cycle (motor thermal protection) ----
+ * Per axis: accumulate motor-on time.  At DUTY_ON_LIMIT_MS, force the
+ * axis off and lock it out for DUTY_OFF_LOCKOUT_MS, then reset.
+ * lockout_end == 0 means "not locked" (a real end-time is always
+ * now + 18min, never 0).  Runs every main-loop iteration; does NOT
+ * run during blocking cal/boot-zero (main loop isn't iterating then),
+ * which is intended -- a single cal stroke is well under the limit. */
+#define DUTY_ON_LIMIT_MS     120000UL   /* 2 min max continuous-ish on */
+#define DUTY_OFF_LOCKOUT_MS  1080000UL  /* then 18 min lockout */
+
+static __xdata unsigned long ns_duty_on_ms = 0;
+static __xdata unsigned long ew_duty_on_ms = 0;
+static __xdata unsigned long ns_duty_lockout_end = 0;
+static __xdata unsigned long ew_duty_lockout_end = 0;
+static __xdata unsigned long duty_last_tick_ms = 0;
+
+/* ---- Storm interlock (Phase 2C-9) ----
+ * High wind forces ST_STORM: drive to the saved horizontal position
+ * (PARKING), then hold there (HOLDING) until wind has stayed below
+ * the release threshold continuously for storm_dwell_min minutes.
+ * storm_parking also suspends duty enforcement -- getting the array
+ * flat in a gust outranks motor thermal protection. */
+#define STORM_POS_TOL_MS  500U   /* "close enough" to horizontal target */
+
+typedef enum { STORM_PARKING = 0, STORM_HOLDING } storm_phase_t;
+static __xdata storm_phase_t storm_phase = STORM_PARKING;
+static __xdata unsigned long storm_dwell_start_ms = 0;
+static __xdata unsigned char storm_parking = 0;
+
+static unsigned char ns_duty_locked(void) { return ns_duty_lockout_end != 0; }
+static unsigned char ew_duty_locked(void) { return ew_duty_lockout_end != 0; }
+
+static void duty_tick(void) {
+    static __xdata unsigned long now, dt;
+    now = millis();
+    dt = now - duty_last_tick_ms;
+    if (dt == 0) return;
+    duty_last_tick_ms = now;
+
+    /* Storm park bypasses duty: reaching horizontal in a gust is more
+     * important than motor thermal limits.  Timestamp still advanced
+     * above so post-park dt isn't a huge jump. */
+    if (storm_parking) return;
+
+    if (ns_duty_lockout_end != 0) {
+        if (now >= ns_duty_lockout_end) {
+            ns_duty_lockout_end = 0;
+            ns_duty_on_ms = 0;
+        }
+    } else if (ns_state != AXIS_OFF) {
+        ns_duty_on_ms += dt;
+        if (ns_duty_on_ms >= DUTY_ON_LIMIT_MS) {
+            set_axis_ns(AXIS_OFF);
+            ns_duty_lockout_end = now + DUTY_OFF_LOCKOUT_MS;
+        }
+    }
+
+    if (ew_duty_lockout_end != 0) {
+        if (now >= ew_duty_lockout_end) {
+            ew_duty_lockout_end = 0;
+            ew_duty_on_ms = 0;
+        }
+    } else if (ew_state != AXIS_OFF) {
+        ew_duty_on_ms += dt;
+        if (ew_duty_on_ms >= DUTY_ON_LIMIT_MS) {
+            set_axis_ew(AXIS_OFF);
+            ew_duty_lockout_end = now + DUTY_OFF_LOCKOUT_MS;
+        }
+    }
+}
+
+/* Reset position to 0 and prime backlash.  Call after any operation
+ * that lands the actuator at the retract endstop (boot zero, cal).
+ * Also re-arms the duty tick clock so the blocking-call time gap isn't
+ * miscredited (accumulators are preserved -- cal motor heat is real). */
+static void position_reset(void) {
+    ns_pos_ms = 0;
+    ew_pos_ms = 0;
+    ns_backlash_ms = EXTEND_BACKLASH_MS;
+    ew_backlash_ms = EXTEND_BACKLASH_MS;
+    ns_pos_prev = AXIS_OFF;
+    ew_pos_prev = AXIS_OFF;
+    pos_last_tick_ms = millis();
+    duty_last_tick_ms = millis();
+}
+
+/* Integrate one axis's contribution this tick.  Encapsulates the
+ * FWD-with-backlash and REV logic so the per-axis call sites are
+ * symmetric. */
+static unsigned int axis_pos_step(axis_state_t state, axis_state_t prev,
+                                  unsigned int pos_ms,
+                                  unsigned int stroke_ms,
+                                  unsigned int *backlash_ms,
+                                  unsigned long dt) {
+    /* `static __xdata` keeps the long arithmetic temps out of DSEG --
+     * same overlay-budget workaround as cal_wait_stall. */
+    static __xdata unsigned long active, eat, np;
+
+    /* Entering REV from anything: prime backlash for the next FWD. */
+    if (state == AXIS_REV && prev != AXIS_REV) {
+        *backlash_ms = EXTEND_BACKLASH_MS;
+    }
+
+    if (state == AXIS_FWD) {
+        active = dt;
+        if (*backlash_ms > 0) {
+            eat = (active < *backlash_ms) ? active : *backlash_ms;
+            *backlash_ms -= (unsigned int)eat;
+            active -= eat;
+        }
+        if (active > 0) {
+            np = (unsigned long)pos_ms + active;
+            pos_ms = (np > stroke_ms) ? stroke_ms : (unsigned int)np;
+        }
+    } else if (state == AXIS_REV) {
+        if (dt >= (unsigned long)pos_ms) pos_ms = 0;
+        else pos_ms -= (unsigned int)dt;
+    }
+    return pos_ms;
+}
+
+/* Update position estimates based on elapsed time since last call.
+ * Should run once per main-loop iteration BEFORE any code that might
+ * change axis state, so the dt that elapses gets credited to the
+ * state that was actually in effect. */
+static void position_tick(void) {
+    static __xdata unsigned long now, dt;
+    now = millis();
+    dt = now - pos_last_tick_ms;
+    if (dt == 0) return;
+    pos_last_tick_ms = now;
+
+    ns_pos_ms = axis_pos_step(ns_state, ns_pos_prev, ns_pos_ms,
+                              ns_stroke_ms, &ns_backlash_ms, dt);
+    ew_pos_ms = axis_pos_step(ew_state, ew_pos_prev, ew_pos_ms,
+                              ew_stroke_ms, &ew_backlash_ms, dt);
+    ns_pos_prev = ns_state;
+    ew_pos_prev = ew_state;
+}
+
+/* Position as 0..100 percent of stroke.  Returns 0 if stroke not yet
+ * calibrated (avoid divide-by-zero). */
+static unsigned char pos_to_pct(unsigned int pos_ms, unsigned int stroke_ms) {
+    unsigned long pct;
+    if (stroke_ms == 0) return 0;
+    pct = (unsigned long)pos_ms * 100UL / stroke_ms;
+    return (pct > 100) ? 100 : (unsigned char)pct;
+}
+
+/* Print a signed value as sign + 3 zero-padded digits, clamped 999. */
+static void lcd_print_sint3(int v) {
+    unsigned int a;
+    if (v < 0) { lcd_putc('-'); a = (unsigned int)(-v); }
+    else       { lcd_putc('+'); a = (unsigned int)v;    }
+    if (a > 999) a = 999;
+    lcd_putc('0' + (a / 100));
+    lcd_putc('0' + ((a / 10) % 10));
+    lcd_putc('0' + (a % 10));
+}
+
+/* ---- Auto-tracking (Phase 2C-8) ----
+ * Differential-balance pulse-tracker.  Every TRACK_CHECK_PERIOD_MS,
+ * read the four sun sensors; if an axis's differential exceeds the
+ * threshold (and the axis is idle and not duty-locked), pulse it
+ * TRACK_PULSE_MS in the correction direction.  Pulses are damped by
+ * the check period so transient shadows don't cause overshoot. */
+#define TRACK_CHECK_PERIOD_MS  5000UL
+#define TRACK_PULSE_MS         500U
+#define TRACK_SENSOR_AVG       8     /* samples per sun sensor read */
+/* Move threshold is the configurable `track_thresh` setting (ADC
+ * counts).  Sensor signal scales with illuminance, so the right value
+ * is wildly different indoors vs. real sun -- hence a Setting. */
+
+static __xdata int           track_dN = 0;   /* cached for display */
+static __xdata int           track_dE = 0;
+static __xdata unsigned long track_last_check_ms = 0;
+static __xdata unsigned long ns_pulse_end_ms = 0;
+static __xdata unsigned long ew_pulse_end_ms = 0;
+/* track_tick() is defined after the state_t enum (it mutates state). */
+
+/* ---- Calibration ----
+ * Runs as a blocking sub-routine called from the ST_CAL main-loop case.
+ * Polls QUIT at every yield point so the user can abort.  All four phases
+ * (retract+extend per axis) use the same three-band classifier on
+ * dI = current_idle - stall_adc:
+ *
+ *     dI band     state       meaning
+ *     ----------- ----------- --------------------------------------------
+ *     dI >= 5     MOVING      motor drawing load current, panel in motion
+ *     dI in 2..4  STALLED     residual draw or motor-just-stopped; band
+ *                             tightened from [1..4] to absorb the ~2-count
+ *                             ADC noise floor that caused idle flicker
+ *     dI <= 1     IDLE        no motor current (or below noise floor)
+ *
+ * Physical interpretation: the pin 8 network is a soft-Zener-clamped
+ * rail-droop monitor.  Transfer function bus -> pin ~= Z_z / R1 ~=
+ * 77 / 2700 ~= 2.85%.  On the install (battery + lossy wiring),
+ * 1-3 V of motor-induced bus droop translates to 6-17 ADC counts at
+ * the pin -- comfortably above the noise floor.  On a stiff bench
+ * supply, droop is smaller and the signal degrades to marginal.
+ *
+ * A stroke is accepted as stalled only after MOVING has been entered
+ * first -- prevents the relay-on inrush from looking like a stall on
+ * stroke 1.  Also: the actuators have internal limit switches that
+ * mechanically open the motor circuit at the endstop, so even if
+ * stall detection misfires, the hardware self-protects.
+ *
+ * Timing:
+ *   - Skip the first 500 ms after relay-on (relay coil pickup ~10 ms +
+ *     motor inrush + DC supply ringdown).
+ *   - 200 ms continuous in the STALLED band (~4 consecutive 50 ms
+ *     samples) confirms stall.  De-assert relay and proceed.
+ *   - Hard timeout at 120 s -- something's wrong if we hit it (relay
+ *     not switching, wire off, supply at current limit, etc).
+ */
+#define CAL_STARTUP_MS     500
+#define CAL_STALL_COUNT    4       /* * 50 ms = 200 ms confirmation */
+#define CAL_TIMEOUT_MS     120000UL
+#define CAL_INTER_STEP_MS  1000
+
+typedef enum {
+    CAL_OK = 0,
+    CAL_ABORTED,
+    CAL_TIMEOUT
+} cal_result_t;
+
+static unsigned int current_idle = 0;
+
+/* Print "+NN" or "-NN" representing (adc - baseline), 2 digits clamped. */
+static void lcd_print_dI(unsigned int adc, unsigned int baseline) {
+    unsigned int diff;
+    if (adc >= baseline) {
+        lcd_putc('+');
+        diff = adc - baseline;
+    } else {
+        lcd_putc('-');
+        diff = baseline - adc;
+    }
+    if (diff > 99) diff = 99;
+    lcd_putc('0' + (diff / 10));
+    lcd_putc('0' + (diff % 10));
+}
+
+static void lcd_print_secs_tenths(unsigned long ms) {
+    unsigned int sec = (unsigned int)(ms / 1000);
+    unsigned int tenths = (unsigned int)((ms / 100) % 10);
+    if (sec > 99) sec = 99;
+    lcd_putc('0' + (sec / 10));
+    lcd_putc('0' + (sec % 10));
+    lcd_putc('.');
+    lcd_putc('0' + tenths);
+    lcd_putc('s');
+}
+
+static void cal_show(const char *label, unsigned long elapsed) {
+    lcd_goto(0, 0); lcd_print_padded(label, 16);
+    lcd_goto(1, 0); lcd_print("Time      ");
+    lcd_print_secs_tenths(elapsed);
+    lcd_putc(' ');
+}
+
+/* Edge-detect QUIT for use inside the blocking calibrate(). */
+static unsigned char cal_quit_pressed(button_t *prev) {
+    unsigned int adc = adc_read(ADC_CH_BUTTONS);
+    button_t curr = button_classify(adc);
+    unsigned char quit = (curr == BTN_QUIT && *prev == BTN_NONE);
+    *prev = curr;
+    return quit;
+}
+
+/* Three-band classification of the stall-current signal for the jog
+ * display.  Matches the thresholds used in cal_wait_stall(): */
+typedef enum {
+    DI_STALLED = 0,   /* dI > -3   (no significant droop) */
+    DI_TRANSIENT,     /* dI in [-5, -3]  (between motion and stall) */
+    DI_MOVING         /* dI < -5   (motor pulling load current) */
+} di_band_t;
+
+static di_band_t di_classify(unsigned int stall_adc) {
+    int di = (int)stall_adc - (int)current_idle;
+    if (di < -5) return DI_MOVING;
+    if (di < -3) return DI_TRANSIENT;
+    return DI_STALLED;
+}
+
+/* Drive one direction (axis already set by caller) and wait for stall.
+ * Returns elapsed ms via *elapsed_out.  Caller is responsible for
+ * de-asserting the relay (we don't know which axis to stop).
+ *
+ * Uses signed dI (stall_adc - current_idle) directly:
+ *   - motion:  dI < -5  (motor pulling load current, droop visible)
+ *   - stall:   dI > -3  (no significant droop; includes overshoot)
+ *   - between: ambiguous transient, hold state
+ *
+ * Asymmetric band edges (motion at -5, stall at -3) give a 2-LSB dead
+ * zone in the middle so noisy samples bouncing between motion and
+ * stall don't ping-pong the state machine.  saw_motion ensures we
+ * don't false-trigger on the inrush-quiet window before motion. */
+static cal_result_t cal_wait_stall(const char *label,
+                                   unsigned long *elapsed_out,
+                                   button_t *prev) {
+    /* `static __xdata` to keep these out of the DSEG overlay region --
+     * SDCC's small-model overlay budget is only 128 bytes and the cal
+     * call chain (5+ levels) blows it.  XRAM has 2 KB free. */
+    static __xdata unsigned long start, elapsed, t;
+    unsigned char stall_count = 0;
+    unsigned char saw_motion = 0;
+
+    /* Skip relay-on inrush transient. */
+    {
+        t = millis();
+        while (millis() - t < CAL_STARTUP_MS) {
+            if (cal_quit_pressed(prev)) return CAL_ABORTED;
+            delay_ms(20);
+        }
+    }
+
+    start = millis();
+    for (;;) {
+        int di_signed;
+
+        if (cal_quit_pressed(prev)) return CAL_ABORTED;
+
+        di_signed = (int)adc_read_avg(ADC_CH_STALL, 8) - (int)current_idle;
+
+        if (di_signed < -5) {
+            /* Motion: clear progress, latch saw_motion. */
+            saw_motion = 1;
+            stall_count = 0;
+        } else if (di_signed > -3 && saw_motion) {
+            /* Stall (dI > -3) after motion observed. */
+            if (++stall_count >= CAL_STALL_COUNT) {
+                *elapsed_out = millis() - start;
+                return CAL_OK;
+            }
+        } else {
+            /* dI in [-5, -3]: transient between motion and stall.
+             * Don't increment, don't reset -- just hold. */
+        }
+
+        elapsed = millis() - start;
+        if (elapsed > CAL_TIMEOUT_MS) return CAL_TIMEOUT;
+
+        cal_show(label, elapsed);
+        delay_ms(50);
+    }
+}
+
+static void cal_inter_step_wait(button_t *prev) {
+    /* 1 s settle between steps (relay release + actuator wind-down). */
+    static __xdata unsigned long t;
+    t = millis();
+    while (millis() - t < CAL_INTER_STEP_MS) {
+        if (cal_quit_pressed(prev)) return;     /* swallow; main loop will catch on next QUIT */
+        delay_ms(50);
+    }
+}
+
+/* ---- Cal axis dispatch + zero/measure helpers ---- */
+
+typedef enum {
+    CAL_AXIS_NS = 0,
+    CAL_AXIS_EW = 1
+} cal_axis_t;
+
+static void cal_axis_set(cal_axis_t axis, axis_state_t state) {
+    if (axis == CAL_AXIS_NS) set_axis_ns(state);
+    else                     set_axis_ew(state);
+}
+
+#define CAL_BUMP_OFF_MS              1000
+#define CAL_EXTEND_STALL_DELAY_MS    1500UL  /* dI takes ~1.5s to settle into the stall band */
+                                             /* after extend motor actually stops at endstop. */
+                                             /* Subtract from t_ext to get true motion time.  */
+
+/* Drive an axis to the retract endstop and stop.  First "bumps off"
+ * any pre-existing retract-endstop position with a short extend stroke,
+ * then retracts to stall.  The bump-off guarantees the subsequent
+ * retract sees motion (avoids the saw_motion gate hanging forever
+ * when starting at the endstop).  Used at both boot (auto-zero) and
+ * the start of each axis measurement during cal. */
+static cal_result_t cal_zero_axis(cal_axis_t axis,
+                                  const char *label,
+                                  button_t *prev) {
+    static __xdata unsigned long elapsed_dummy, t;
+    cal_result_t r;
+
+    /* Bump-off: drive extend for a fixed short duration. */
+    cal_axis_set(axis, AXIS_FWD);
+    {
+        t = millis();
+        while (millis() - t < CAL_BUMP_OFF_MS) {
+            if (cal_quit_pressed(prev)) {
+                cal_axis_set(axis, AXIS_OFF);
+                return CAL_ABORTED;
+            }
+            cal_show(label, millis() - t);
+            delay_ms(50);
+        }
+    }
+    cal_axis_set(axis, AXIS_OFF);
+    cal_inter_step_wait(prev);
+
+    /* Retract to stall.  Axis now at retract endstop = position 0. */
+    cal_axis_set(axis, AXIS_REV);
+    r = cal_wait_stall(label, &elapsed_dummy, prev);
+    cal_axis_set(axis, AXIS_OFF);
+    return r;
+}
+
+/* Measure stroke time for one axis.  Sequence:
+ *   1. zero (bump-off + retract-to-stall)
+ *   2. extend to stall, time it -> t_ext  (corrected for backlash)
+ *   3. retract to stall, time it -> t_ret
+ * Returns max(t_ext, t_ret) as the safe stroke time.
+ *
+ * Extend stall-delay correction: at the extend endstop, the dI signal
+ * takes ~1.5 s to settle into the "no current" band after the motor
+ * actually stops (slow rail recovery + filter cap discharge through
+ * the 2.7k/3k network).  cal_wait_stall therefore overshoots the real
+ * stroke time by that amount.  Subtract CAL_EXTEND_STALL_DELAY_MS
+ * from t_ext to get the true motion duration.  Retract has no
+ * equivalent delay because the retract-endstop stall signature is
+ * promptly visible. */
+static cal_result_t cal_measure_axis(cal_axis_t axis,
+                                     const char *lbl_zero,
+                                     const char *lbl_ext,
+                                     const char *lbl_ret,
+                                     unsigned int *stroke_out,
+                                     button_t *prev) {
+    static __xdata unsigned long t_ext, t_ret, t_max;
+    cal_result_t r;
+
+    r = cal_zero_axis(axis, lbl_zero, prev);
+    if (r != CAL_OK) return r;
+    cal_inter_step_wait(prev);
+
+    cal_axis_set(axis, AXIS_FWD);
+    r = cal_wait_stall(lbl_ext, &t_ext, prev);
+    cal_axis_set(axis, AXIS_OFF);
+    if (r != CAL_OK) return r;
+    /* Subtract extend stall-detect delay from t_ext.  Saturate to 0
+     * to avoid unsigned underflow on a very short stroke. */
+    t_ext = (t_ext > CAL_EXTEND_STALL_DELAY_MS) ? (t_ext - CAL_EXTEND_STALL_DELAY_MS) : 0;
+    cal_inter_step_wait(prev);
+
+    cal_axis_set(axis, AXIS_REV);
+    r = cal_wait_stall(lbl_ret, &t_ret, prev);
+    cal_axis_set(axis, AXIS_OFF);
+    if (r != CAL_OK) return r;
+
+    t_max = (t_ext > t_ret) ? t_ext : t_ret;
+    *stroke_out = (t_max > 0xFFFF) ? 0xFFFF : (unsigned int)t_max;
+    return CAL_OK;
+}
+
+static cal_result_t calibrate(void) {
+    button_t prev = BTN_NONE;
+    cal_result_t r;
+
+    /* Capture baseline with all relays guaranteed off. */
+    set_axis_ns(AXIS_OFF);
+    set_axis_ew(AXIS_OFF);
+    delay_ms(200);
+    current_idle = adc_read_avg(ADC_CH_STALL, 16);
+
+    r = cal_measure_axis(CAL_AXIS_NS,
+                         "Cal NS zero", "Cal NS ext", "Cal NS ret",
+                         &ns_stroke_ms, &prev);
+    if (r != CAL_OK) return r;
+    cal_inter_step_wait(&prev);
+
+    r = cal_measure_axis(CAL_AXIS_EW,
+                         "Cal EW zero", "Cal EW ext", "Cal EW ret",
+                         &ew_stroke_ms, &prev);
+    if (r != CAL_OK) return r;
+
+    /* Default horizontal = mid-stroke; user can override via Save Horizontal. */
+    horiz_ns_pct = 50;
+    horiz_ew_pct = 50;
+
+    config_save();
+    return CAL_OK;
+}
+
+/* Boot-time auto-zero: drive both axes to retract endstop.  Re-establishes
+ * the position-tracking origin after every power cycle.  Called once
+ * from main() at startup when calibration data is present. */
+static cal_result_t boot_zero(void) {
+    button_t prev = BTN_NONE;
+    cal_result_t r;
+
+    set_axis_ns(AXIS_OFF);
+    set_axis_ew(AXIS_OFF);
+    delay_ms(200);
+    current_idle = adc_read_avg(ADC_CH_STALL, 16);
+
+    r = cal_zero_axis(CAL_AXIS_NS, "Boot zero NS", &prev);
+    if (r != CAL_OK) {
+        set_axis_ns(AXIS_OFF);
+        return r;
+    }
+    cal_inter_step_wait(&prev);
+
+    r = cal_zero_axis(CAL_AXIS_EW, "Boot zero EW", &prev);
+    set_axis_ew(AXIS_OFF);
+    return r;
+}
+
+/* ---- Version info ---- */
+#define FIRMWARE_VERSION "EcoWorthy v0.2c "
+/* __DATE__ expands to "Mmm DD YYYY" (e.g. "May 12 2026"), 11 chars. */
+static const char build_date[] = __DATE__;
+
+/* ---- State machine ---- */
+typedef enum {
+    ST_NO_CAL,
+    ST_IDLE,
+    ST_MENU,
+    ST_TRACK,
+    ST_STORM,
+    ST_JOG,
+    ST_CAL,
+    ST_BTEST,           /* backlash characterization */
+    ST_SETTINGS,        /* settings sub-menu */
+    ST_SETTINGS_EDIT,   /* editing a single setting value */
+    ST_VERSION
+} state_t;
+
+/* ---- Settings sub-menu ----
+ * Three configurable values; backed by EEPROM bytes 8..10.  Each
+ * setting has a name, a range (min, max), and an optional unit string
+ * shown in the edit view.  Editing supports short-press = 1 unit and
+ * press-and-hold = auto-repeat after a 500 ms grace period.
+ */
+typedef enum {
+    SET_WIND_STORM = 0,
+    SET_WIND_RELEASE,
+    SET_STORM_DWELL,
+    SET_TRACK_THRESH,
+    SET_COUNT
+} setting_t;
+
+typedef struct {
+    const char *short_label;  /* shown in the list (up to 12 chars) */
+    const char *full_label;   /* shown when editing (up to 16 chars) */
+    const char *unit;
+    unsigned char min;
+    unsigned char max;
+} setting_def_t;
+
+static const setting_def_t setting_defs[SET_COUNT] = {
+    { "W.Storm",  "Wind storm",     "m/s", WIND_STORM_MIN,   WIND_STORM_MAX   },
+    { "W.Rel",    "Wind release",   "m/s", WIND_RELEASE_MIN, WIND_RELEASE_MAX },
+    { "S.Dwell",  "Storm dwell",    "min", DWELL_MIN_MIN,    DWELL_MIN_MAX    },
+    { "TrkThr",   "Track thresh",   "adc", TRACK_THRESH_MIN, TRACK_THRESH_MAX },
+};
+
+static unsigned char setting_get(setting_t s) {
+    switch (s) {
+        case SET_WIND_STORM:   return wind_storm_mps;
+        case SET_WIND_RELEASE: return wind_release_mps;
+        case SET_STORM_DWELL:  return storm_dwell_min;
+        case SET_TRACK_THRESH: return track_thresh;
+        default:               return 0;
+    }
+}
+
+static void setting_set(setting_t s, unsigned char v) {
+    switch (s) {
+        case SET_WIND_STORM:   wind_storm_mps   = v; break;
+        case SET_WIND_RELEASE: wind_release_mps = v; break;
+        case SET_STORM_DWELL:  storm_dwell_min  = v; break;
+        case SET_TRACK_THRESH: track_thresh     = v; break;
+        default: break;
+    }
+}
+
+/* Edit-mode state.  Loaded when ST_SETTINGS dispatches via SET. */
+static __xdata unsigned char edit_setting_idx = 0;
+static __xdata unsigned char edit_value = 0;
+static __xdata unsigned char edit_original = 0;
+
+/* Settings list scroll state (separate from main-menu window vars). */
+static __xdata unsigned char set_win_top  = 0;
+static __xdata unsigned char set_cursor_r = 0;
+
+/* Press-and-hold tracking for auto-repeat in ST_SETTINGS_EDIT.  Reset
+ * whenever the held button changes.  Holds for >= HOLD_DELAY_TICKS
+ * generate repeat events every REPEAT_PERIOD_TICKS. */
+static __xdata button_t      btn_hold_target = BTN_NONE;
+static __xdata unsigned int  btn_hold_ticks  = 0;
+#define HOLD_DELAY_TICKS     10   /* 10 * 50ms = 500ms grace before auto-repeat */
+#define REPEAT_PERIOD_TICKS   2   /*  2 * 50ms = 100ms = 10 steps/sec */
+
+/* Returns nonzero on edge press of `which`, OR when held past the
+ * grace period at a REPEAT_PERIOD_TICKS-aligned tick.  Auto-repeat is
+ * driven by the global btn_hold_target/btn_hold_ticks pair, so calling
+ * code only needs to ask "should I step now?". */
+static unsigned char btn_step_now(button_t which, button_t pressed) {
+    if (pressed == which) return 1;
+    if (btn_hold_target == which &&
+        btn_hold_ticks  >= HOLD_DELAY_TICKS) {
+        unsigned int over = btn_hold_ticks - HOLD_DELAY_TICKS;
+        if ((over % REPEAT_PERIOD_TICKS) == 0) return 1;
+    }
+    return 0;
+}
+
+/* ST_IDLE screen.  Extracted so its sensor-read locals get a separate
+ * overlay region (main()'s DSEG frame is at the budget limit). */
+static void idle_screen(void) {
+    static __xdata unsigned int sun_n, sun_s, sun_e, sun_w, wind;
+    static __xdata unsigned char mps;
+
+    sun_n = adc_read(ADC_CH_SUN_N);
+    sun_s = adc_read(ADC_CH_SUN_S);
+    sun_e = adc_read(ADC_CH_SUN_E);
+    sun_w = adc_read(ADC_CH_SUN_W);
+    wind  = adc_read(ADC_CH_WIND);
+
+    lcd_goto(0, 0);
+    lcd_putc('N'); lcd_putc('0' + (sun_n / 100));
+    lcd_putc('0' + ((sun_n / 10) % 10)); lcd_putc('0' + (sun_n % 10));
+    lcd_putc('S'); lcd_putc('0' + (sun_s / 100));
+    lcd_putc('0' + ((sun_s / 10) % 10)); lcd_putc('0' + (sun_s % 10));
+    lcd_putc('E'); lcd_putc('0' + (sun_e / 100));
+    lcd_putc('0' + ((sun_e / 10) % 10)); lcd_putc('0' + (sun_e % 10));
+    lcd_putc('W'); lcd_putc('0' + (sun_w / 100));
+    lcd_putc('0' + ((sun_w / 10) % 10)); lcd_putc('0' + (sun_w % 10));
+
+    mps = wind_mps(wind);
+    lcd_goto(1, 0);
+    lcd_print("Idle    Wnd=");
+    lcd_putc('0' + (mps / 10));
+    lcd_putc('0' + (mps % 10));
+    lcd_print("  ");
+}
+
+/* ST_TRACK body.  Extracted so its locals get a separate overlay
+ * region (main()'s DSEG frame is at the budget limit). */
+static void track_tick(button_t pressed, state_t *state) {
+    static __xdata unsigned long now;
+    static __xdata unsigned int sn, ss, se, sw;
+
+    now = millis();
+
+    /* End expired pulses. */
+    if (ns_pulse_end_ms != 0 && now >= ns_pulse_end_ms) {
+        set_axis_ns(AXIS_OFF);
+        ns_pulse_end_ms = 0;
+    }
+    if (ew_pulse_end_ms != 0 && now >= ew_pulse_end_ms) {
+        set_axis_ew(AXIS_OFF);
+        ew_pulse_end_ms = 0;
+    }
+
+    /* Periodic sensor read + correction decision. */
+    if (now - track_last_check_ms >= TRACK_CHECK_PERIOD_MS) {
+        track_last_check_ms = now;
+        sn = adc_read_avg(ADC_CH_SUN_N, TRACK_SENSOR_AVG);
+        ss = adc_read_avg(ADC_CH_SUN_S, TRACK_SENSOR_AVG);
+        se = adc_read_avg(ADC_CH_SUN_E, TRACK_SENSOR_AVG);
+        sw = adc_read_avg(ADC_CH_SUN_W, TRACK_SENSOR_AVG);
+        track_dN = (int)sn - (int)ss;
+        track_dE = (int)se - (int)sw;
+
+        if (ns_state == AXIS_OFF && ns_pulse_end_ms == 0 && !ns_duty_locked()) {
+            if (track_dN > (int)track_thresh) {
+                set_axis_ns(AXIS_FWD);
+                ns_pulse_end_ms = now + TRACK_PULSE_MS;
+            } else if (track_dN < -(int)track_thresh) {
+                set_axis_ns(AXIS_REV);
+                ns_pulse_end_ms = now + TRACK_PULSE_MS;
+            }
+        }
+        if (ew_state == AXIS_OFF && ew_pulse_end_ms == 0 && !ew_duty_locked()) {
+            if (track_dE > (int)track_thresh) {
+                set_axis_ew(AXIS_FWD);
+                ew_pulse_end_ms = now + TRACK_PULSE_MS;
+            } else if (track_dE < -(int)track_thresh) {
+                set_axis_ew(AXIS_REV);
+                ew_pulse_end_ms = now + TRACK_PULSE_MS;
+            }
+        }
+    }
+
+    /* Row 0: "Track  NS=N EW=E" -- 16 chars. */
+    lcd_goto(0, 0);
+    lcd_print("Track  NS=");
+    lcd_putc(ns_char(ns_state));
+    lcd_print(" EW=");
+    lcd_putc(ew_char(ew_state));
+
+    /* Row 1: "dN=+045 dE=-012 " -- 16 chars. */
+    lcd_goto(1, 0);
+    lcd_print("dN=");
+    lcd_print_sint3(track_dN);
+    lcd_print(" dE=");
+    lcd_print_sint3(track_dE);
+    lcd_putc(' ');
+
+    if (pressed == BTN_QUIT) {
+        set_axis_ns(AXIS_OFF);
+        set_axis_ew(AXIS_OFF);
+        ns_pulse_end_ms = 0;
+        ew_pulse_end_ms = 0;
+        lcd_clear();
+        *state = ST_MENU;
+    }
+}
+
+/* Main-loop wind watchdog.  Runs every iteration regardless of mode.
+ * On a storm-strength gust, force ST_STORM (PARKING) and reset duty
+ * (safety > thermal).  No-op if already storming or uncalibrated
+ * (can't compute a horizontal target without stroke times). */
+static void storm_check(state_t *state) {
+    static __xdata unsigned char w;
+    if (*state == ST_STORM) return;
+    if (!config_is_valid()) return;
+    w = wind_mps(adc_read_avg(ADC_CH_WIND, 8));
+    if (w >= wind_storm_mps) {
+        ns_duty_on_ms = 0; ew_duty_on_ms = 0;
+        ns_duty_lockout_end = 0; ew_duty_lockout_end = 0;
+        duty_last_tick_ms = millis();
+        ns_pulse_end_ms = 0; ew_pulse_end_ms = 0;  /* cancel track pulses */
+        storm_phase = STORM_PARKING;
+        storm_parking = 1;
+        lcd_clear();
+        *state = ST_STORM;
+    }
+}
+
+/* ST_STORM body.  PARKING: seek both axes to the horizontal target.
+ * HOLDING: axes off, run the resettable dwell timer.  Exits only to
+ * ST_TRACK when wind has stayed below release for storm_dwell_min. */
+static void storm_tick(state_t *state) {
+    static __xdata unsigned long now, tgt_ns, tgt_ew, elapsed, need, remain;
+    static __xdata unsigned char w, ns_ok, ew_ok;
+
+    now = millis();
+    w   = wind_mps(adc_read_avg(ADC_CH_WIND, 8));
+
+    if (storm_phase == STORM_PARKING) {
+        tgt_ns = (unsigned long)horiz_ns_pct * ns_stroke_ms / 100UL;
+        tgt_ew = (unsigned long)horiz_ew_pct * ew_stroke_ms / 100UL;
+
+        ns_ok = 0;
+        if ((unsigned long)ns_pos_ms + STORM_POS_TOL_MS < tgt_ns) {
+            set_axis_ns(AXIS_FWD);
+        } else if ((unsigned long)ns_pos_ms > tgt_ns + STORM_POS_TOL_MS) {
+            set_axis_ns(AXIS_REV);
+        } else {
+            set_axis_ns(AXIS_OFF);
+            ns_ok = 1;
+        }
+
+        ew_ok = 0;
+        if ((unsigned long)ew_pos_ms + STORM_POS_TOL_MS < tgt_ew) {
+            set_axis_ew(AXIS_FWD);
+        } else if ((unsigned long)ew_pos_ms > tgt_ew + STORM_POS_TOL_MS) {
+            set_axis_ew(AXIS_REV);
+        } else {
+            set_axis_ew(AXIS_OFF);
+            ew_ok = 1;
+        }
+
+        if (ns_ok && ew_ok) {
+            storm_phase = STORM_HOLDING;
+            storm_parking = 0;            /* resume duty accounting */
+            storm_dwell_start_ms = now;   /* start dwell clock */
+        }
+
+        lcd_goto(0, 0); lcd_print_padded("STORM  PARK", 16);
+        lcd_goto(1, 0);
+        lcd_print("Wnd=");
+        lcd_putc('0' + (w / 10));
+        lcd_putc('0' + (w % 10));
+        lcd_print(" ->horiz  ");
+    } else {
+        /* HOLDING: axes off, monitor wind + dwell. */
+        set_axis_ns(AXIS_OFF);
+        set_axis_ew(AXIS_OFF);
+
+        if (w >= wind_release_mps) {
+            storm_dwell_start_ms = now;   /* any spike resets the dwell */
+        }
+        elapsed = now - storm_dwell_start_ms;
+        need    = (unsigned long)storm_dwell_min * 60000UL;
+
+        if (elapsed >= need) {
+            lcd_clear();
+            track_last_check_ms = millis();   /* fresh tracking eval */
+            *state = ST_TRACK;
+            return;
+        }
+
+        remain = (need - elapsed + 59999UL) / 60000UL;   /* ceil minutes */
+        if (remain > 99) remain = 99;
+        lcd_goto(0, 0); lcd_print_padded("STORM  HOLD", 16);
+        lcd_goto(1, 0);
+        lcd_print("Wnd=");
+        lcd_putc('0' + (w / 10));
+        lcd_putc('0' + (w % 10));
+        lcd_print(" Dwl=");
+        lcd_putc('0' + ((unsigned char)remain / 10));
+        lcd_putc('0' + ((unsigned char)remain % 10));
+        lcd_print("m ");
+    }
+}
+
+/* ST_SETTINGS list body.  Extracted to keep main()'s overlay frame
+ * within the DSEG budget.  Mutates *state on SET/QUIT. */
+static void settings_list_tick(button_t pressed, state_t *state) {
+    static __xdata unsigned char row, idx, v, sel;
+
+    for (row = 0; row < 2; row++) {
+        idx = set_win_top + row;
+        lcd_goto(row, 0);
+        lcd_putc(set_cursor_r == row ? '>' : ' ');
+        lcd_putc(' ');
+        if (idx < SET_COUNT) {
+            v = setting_get((setting_t)idx);
+            lcd_print_padded(setting_defs[idx].short_label, 12);
+            lcd_putc('0' + (v / 10));
+            lcd_putc('0' + (v % 10));
+        } else {
+            lcd_print_padded("", 14);
+        }
+    }
+
+    if (pressed == BTN_NORTH) {
+        if (set_cursor_r == 1) {
+            set_cursor_r = 0;
+        } else if (set_win_top > 0) {
+            set_win_top--;
+        }
+    } else if (pressed == BTN_SOUTH) {
+        if (set_cursor_r == 0 && set_win_top + 1 < SET_COUNT) {
+            set_cursor_r = 1;
+        } else if (set_win_top + 2 < SET_COUNT) {
+            set_win_top++;
+        }
+    } else if (pressed == BTN_SET) {
+        sel = set_win_top + set_cursor_r;
+        if (sel < SET_COUNT) {
+            edit_setting_idx = sel;
+            edit_original    = setting_get((setting_t)sel);
+            edit_value       = edit_original;
+            lcd_clear();
+            *state = ST_SETTINGS_EDIT;
+        }
+    } else if (pressed == BTN_QUIT) {
+        lcd_clear();
+        *state = ST_MENU;
+    }
+}
+
+/* ST_SETTINGS_EDIT body, extracted to keep main()'s overlay frame
+ * within the DSEG budget.  Mutates *state to ST_SETTINGS on SET (save)
+ * or QUIT (revert). */
+static void settings_edit_tick(button_t pressed, state_t *state) {
+    static __xdata setting_t s;
+    static __xdata unsigned char mn, mx;
+
+    s  = (setting_t)edit_setting_idx;
+    mn = setting_defs[s].min;
+    mx = setting_defs[s].max;
+
+    if (btn_step_now(BTN_NORTH, pressed) && edit_value < mx) edit_value++;
+    if (btn_step_now(BTN_SOUTH, pressed) && edit_value > mn) edit_value--;
+
+    lcd_goto(0, 0);
+    lcd_print_padded(setting_defs[s].full_label, 16);
+    lcd_goto(1, 0);
+    lcd_print("   ");
+    lcd_putc('0' + (edit_value / 10));
+    lcd_putc('0' + (edit_value % 10));
+    lcd_putc(' ');
+    lcd_print_padded(setting_defs[s].unit, 10);
+
+    if (pressed == BTN_SET) {
+        setting_set(s, edit_value);
+        config_save();
+        lcd_clear();
+        *state = ST_SETTINGS;
+    } else if (pressed == BTN_QUIT) {
+        setting_set(s, edit_original);  /* revert */
+        lcd_clear();
+        *state = ST_SETTINGS;
+    }
+}
+
+/* ST_JOG body.  Extracted to keep main()'s overlay frame within the
+ * DSEG budget.  `idle_timeout` is precomputed by the caller (the
+ * idle_ticks var is a main-scope alias not visible here). */
+static void jog_tick(button_t pressed, button_t curr_button,
+                     unsigned char idle_timeout, state_t *state) {
+    static __xdata axis_state_t tgt_ns, tgt_ew;
+    static __xdata unsigned char ns_pct, ew_pct, mps;
+    static __xdata unsigned int wind;
+
+    tgt_ns = AXIS_OFF;
+    tgt_ew = AXIS_OFF;
+    switch (curr_button) {
+        case BTN_NORTH: tgt_ns = AXIS_FWD; break;
+        case BTN_SOUTH: tgt_ns = AXIS_REV; break;
+        case BTN_EAST:  tgt_ew = AXIS_FWD; break;
+        case BTN_WEST:  tgt_ew = AXIS_REV; break;
+        default: break;
+    }
+    /* Respect duty lockout even in manual jog. */
+    if (ns_duty_locked()) tgt_ns = AXIS_OFF;
+    if (ew_duty_locked()) tgt_ew = AXIS_OFF;
+    set_axis_ns(tgt_ns);
+    set_axis_ew(tgt_ew);
+
+    /* Save Horizontal: SET while both axes off -> capture pos -> EEPROM. */
+    if (pressed == BTN_SET &&
+        ns_state == AXIS_OFF && ew_state == AXIS_OFF) {
+        horiz_ns_pct = pos_to_pct(ns_pos_ms, ns_stroke_ms);
+        horiz_ew_pct = pos_to_pct(ew_pos_ms, ew_stroke_ms);
+        config_save();
+        lcd_clear();
+        lcd_goto(0, 0); lcd_print_padded("Saved horiz", 16);
+        lcd_goto(1, 0);
+        lcd_print("NS=");
+        lcd_putc('0' + (horiz_ns_pct / 100));
+        lcd_putc('0' + ((horiz_ns_pct / 10) % 10));
+        lcd_putc('0' + (horiz_ns_pct % 10));
+        lcd_print(" EW=");
+        lcd_putc('0' + (horiz_ew_pct / 100));
+        lcd_putc('0' + ((horiz_ew_pct / 10) % 10));
+        lcd_putc('0' + (horiz_ew_pct % 10));
+        lcd_print("  ");
+        delay_ms(1500);
+        lcd_clear();
+        pos_last_tick_ms = millis();
+    }
+
+    /* Layout A: position % on row 0, arrows + wind on row 1. */
+    ns_pct = pos_to_pct(ns_pos_ms, ns_stroke_ms);
+    ew_pct = pos_to_pct(ew_pos_ms, ew_stroke_ms);
+    wind   = adc_read(ADC_CH_WIND);
+    mps    = wind_mps(wind);
+
+    lcd_goto(0, 0);
+    lcd_print("NS=");
+    lcd_putc('0' + (ns_pct / 100));
+    lcd_putc('0' + ((ns_pct / 10) % 10));
+    lcd_putc('0' + (ns_pct % 10));
+    lcd_print(" EW=");
+    lcd_putc('0' + (ew_pct / 100));
+    lcd_putc('0' + ((ew_pct / 10) % 10));
+    lcd_putc('0' + (ew_pct % 10));
+    lcd_print("  ");
+
+    lcd_goto(1, 0);
+    lcd_print("NS=");
+    lcd_putc(ns_char(ns_state));
+    lcd_print(" EW=");
+    lcd_putc(ew_char(ew_state));
+    lcd_print(" Wnd=");
+    lcd_putc('0' + (mps / 10));
+    lcd_putc('0' + (mps % 10));
+
+    if (pressed == BTN_QUIT) {
+        set_axis_ns(AXIS_OFF);
+        set_axis_ew(AXIS_OFF);
+        lcd_clear();
+        *state = ST_MENU;
+    } else if (idle_timeout) {
+        set_axis_ns(AXIS_OFF);
+        set_axis_ew(AXIS_OFF);
+        lcd_clear();
+        *state = ST_IDLE;
+    }
+}
+
+typedef enum {
+    MENU_TRACK = 0,
+    MENU_JOG,
+    MENU_CALIBRATE,
+    MENU_BLASH,
+    MENU_SETTINGS,
+    MENU_VERSION,
+    MENU_COUNT
+} menu_item_t;
+
+static const char * const menu_labels[MENU_COUNT] = {
+    "Track",
+    "Jog",
+    "Calibrate",
+    "Backlash",
+    "Settings",
+    "Version"
+};
+
+/* Backlash test state.  Persistent across menu entries (resets on menu
+ * SET); btest_pulse_ms increments by 20 each SET-run inside ST_BTEST. */
+static __xdata cal_axis_t btest_axis = CAL_AXIS_NS;
+static __xdata unsigned int btest_pulse_ms = 20;
+
+#define INACTIVITY_LIMIT  600
+
+/* Button debounce: require N consecutive identical classifications
+ * before accepting a button value.  Filters out the misclassifications
+ * that occur during release-ramp, when the analog bus voltage decays
+ * monotonically through every other button's threshold on its way
+ * back to 0.  At the 50 ms main-loop cadence, N=2 gives 100 ms
+ * confirmation latency -- bump to 3 if misclassifications persist. */
+#define BTN_DEBOUNCE_N  2
+
+/* main()'s persistent loop state.  Hoisted to file-scope __xdata so
+ * they don't compete for the tiny DSEG overlay region (only ~22 bytes
+ * available after stack and reg-banks).  No semantic change -- main
+ * never returns, so file scope vs. local scope is equivalent here. */
+static __xdata state_t state_m;
+static __xdata unsigned char window_top_m  = 0;
+static __xdata unsigned char cursor_row_m  = 0;
+static __xdata button_t      prev_button_m = BTN_NONE;
+static __xdata button_t      db_candidate_m = BTN_NONE;
+static __xdata unsigned char db_count_m    = 0;
+static __xdata unsigned int  idle_ticks_m  = 0;
+
+#define state        state_m
+#define window_top   window_top_m
+#define cursor_row   cursor_row_m
+#define prev_button  prev_button_m
+#define db_candidate db_candidate_m
+#define db_count     db_count_m
+#define idle_ticks   idle_ticks_m
+
 void main(void) {
+
     /* Relay-safe boot. */
     P3 = 0x00;
     P5 &= ~(1 << 4);
     BUZZER = 1;
 
-    P3M0 |=  (1 << 0) | (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7);
-    P3M1 &= ~((1 << 0) | (1 << 1) | (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7));
+    /* Push-pull outputs.  Note P3 bit 4 (LCD_BL, pin 19) added. */
+    P3M0 |=  (1 << 0) | (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+    P3M1 &= ~((1 << 0) | (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7));
     P5M0 |=  (1 << 4);
     P5M1 &= ~(1 << 4);
     P1M0 |=  (1 << 7);
@@ -193,53 +1454,306 @@ void main(void) {
     P1M0 &= ~ANALOG_PINS;
     P1ASF = ANALOG_PINS;
 
+    /* Backlight on for the duration of normal operation.  Future work:
+     * dim or auto-off after inactivity to save power. */
+    LCD_BL = 1;
+
     lcd_init();
     adc_init();
+    timer0_init();        /* start 1 kHz ms counter for millis() */
+    config_load();        /* pull stroke times + horizontal from EEPROM if cal'd */
+
+    /* Capture stall-current baseline with all relays guaranteed OFF.
+     * Used by jog dI display and (re-captured) by calibration. */
+    delay_ms(200);
+    current_idle = adc_read_avg(ADC_CH_STALL, 16);
+
+    state = config_is_valid() ? ST_IDLE : ST_NO_CAL;
+
+    /* If calibrated, run auto-zero before entering normal operation.
+     * Failure (timeout or user QUIT) falls through to IDLE -- the user
+     * can re-zero manually via the Calibrate menu item. */
+    if (state == ST_IDLE) {
+        cal_result_t r = boot_zero();
+        set_axis_ns(AXIS_OFF);
+        set_axis_ew(AXIS_OFF);
+        if (r != CAL_OK) {
+            lcd_clear();
+            lcd_goto(0, 0); lcd_print_padded("Zero failed", 16);
+            lcd_goto(1, 0);
+            lcd_print_padded((r == CAL_ABORTED) ? "(aborted)" : "(timeout)", 16);
+            delay_ms(2000);
+        }
+    }
+    position_reset();   /* zero pos vars + arm pos_last_tick_ms */
+    lcd_clear();
 
     for (;;) {
-        unsigned int sun_n = adc_read(ADC_CH_SUN_N);
-        unsigned int sun_s = adc_read(ADC_CH_SUN_S);
-        unsigned int sun_e = adc_read(ADC_CH_SUN_E);
-        unsigned int sun_w = adc_read(ADC_CH_SUN_W);
-        unsigned int wind  = adc_read(ADC_CH_WIND);
-        unsigned int btn_v = adc_read(ADC_CH_BUTTONS);
-        button_t b = button_classify(btn_v);
+        unsigned int btn_adc;
+        button_t raw_button;
+        button_t curr_button;
+        button_t pressed;
 
-        /* Button -> axis target.  Cardinal-intuitive mapping: N/S buttons
-         * both drive the tilt axis, E/W buttons both drive the rotate
-         * axis.  The relay labels don't help here -- physical H-bridge
-         * pairs are {RELAY_N, RELAY_W} and {RELAY_S, RELAY_E}, so the
-         * S-button routes to RELAY_W and the W-button to RELAY_S. */
-        axis_state_t tgt_ns = AXIS_OFF;
-        axis_state_t tgt_ew = AXIS_OFF;
-        switch (b) {
-            case BTN_NORTH: tgt_ns = AXIS_FWD; break;  /* RELAY_N -> extend -> tilt N */
-            case BTN_SOUTH: tgt_ns = AXIS_REV; break;  /* RELAY_W -> retract -> tilt S */
-            case BTN_EAST:  tgt_ew = AXIS_FWD; break;  /* RELAY_S -> extend -> rotate E */
-            case BTN_WEST:  tgt_ew = AXIS_REV; break;  /* RELAY_E -> retract -> rotate W */
-            default: break;
+        /* Integrate position based on whatever axis state was in effect
+         * for the time elapsed since the last loop iteration.  Must run
+         * BEFORE any code that mutates ns_state / ew_state so the dt is
+         * credited to the right state. */
+        position_tick();
+        duty_tick();   /* enforce motor on-time limit regardless of mode */
+        storm_check(&state);  /* wind watchdog -- may force ST_STORM */
+
+        btn_adc = adc_read(ADC_CH_BUTTONS);
+        raw_button = button_classify(btn_adc);
+
+        /* Debounce: confirm a new button only after BTN_DEBOUNCE_N
+         * consecutive identical raw classifications.  Until then,
+         * curr_button keeps its last confirmed value (which means a
+         * release-ramp transient won't briefly register as a different
+         * key). */
+        if (raw_button == db_candidate) {
+            if (db_count < 255) db_count++;
+        } else {
+            db_candidate = raw_button;
+            db_count = 1;
         }
-        set_axis_ns(tgt_ns);
-        set_axis_ew(tgt_ew);
+        curr_button = (db_count >= BTN_DEBOUNCE_N) ? db_candidate : prev_button;
 
-        /* Line 1: "N999S999E999W999"  -- sun sensors. */
-        lcd_goto(0, 0);
-        lcd_putc('N'); lcd_print_u16_3d(sun_n);
-        lcd_putc('S'); lcd_print_u16_3d(sun_s);
-        lcd_putc('E'); lcd_print_u16_3d(sun_e);
-        lcd_putc('W'); lcd_print_u16_3d(sun_w);
+        pressed = (curr_button != BTN_NONE && prev_button == BTN_NONE)
+                  ? curr_button : BTN_NONE;
+        prev_button = curr_button;
 
-        /* Line 2: "NS=N EW=E Wnd=50"  -- axis states + wind speed (m/s). */
-        {
-            unsigned char mps = wind_mps(wind);
+        /* Hold tracker: counts main-loop iterations while the same
+         * (non-NONE) button stays debounced.  Read by ST_SETTINGS_EDIT
+         * to gate auto-repeat. */
+        if (curr_button != btn_hold_target) {
+            btn_hold_target = curr_button;
+            btn_hold_ticks = 0;
+        } else if (curr_button != BTN_NONE && btn_hold_ticks < 65000) {
+            btn_hold_ticks++;
+        }
+
+        if (curr_button != BTN_NONE) {
+            idle_ticks = 0;
+        } else if (idle_ticks < INACTIVITY_LIMIT) {
+            idle_ticks++;
+        }
+
+        /* Backlight follows activity: any button press lights it; sustained
+         * inactivity turns it off.  Same threshold as the menu auto-exit
+         * so they happen together. */
+        LCD_BL = (idle_ticks < INACTIVITY_LIMIT) ? 1 : 0;
+
+        switch (state) {
+
+        case ST_NO_CAL:
+            lcd_goto(0, 0); lcd_print_padded("Not calibrated", 16);
+            lcd_goto(1, 0); lcd_print_padded("Press SET to cal", 16);
+            if (pressed == BTN_SET) {
+                lcd_clear();
+                state = ST_CAL;
+            }
+            break;
+
+        case ST_IDLE:
+            idle_screen();
+            if (pressed == BTN_SET) {
+                lcd_clear();
+                window_top = 0;
+                cursor_row = 0;
+                idle_ticks = 0;
+                state = ST_MENU;
+            }
+            break;
+
+        case ST_MENU: {
+            lcd_goto(0, 0);
+            lcd_putc(cursor_row == 0 ? '>' : ' ');
+            lcd_putc(' ');
+            lcd_print_padded(menu_labels[window_top], 14);
+
             lcd_goto(1, 0);
-            lcd_print("NS=");
-            lcd_putc(ns_char(ns_state));
-            lcd_print(" EW=");
-            lcd_putc(ew_char(ew_state));
-            lcd_print(" Wnd=");
-            lcd_putc('0' + (mps / 10));
-            lcd_putc('0' + (mps % 10));
+            lcd_putc(cursor_row == 1 ? '>' : ' ');
+            lcd_putc(' ');
+            if (window_top + 1 < MENU_COUNT) {
+                lcd_print_padded(menu_labels[window_top + 1], 14);
+            } else {
+                lcd_print_padded("", 14);
+            }
+
+            if (pressed == BTN_NORTH) {
+                if (cursor_row == 1) {
+                    cursor_row = 0;
+                } else if (window_top > 0) {
+                    window_top--;
+                }
+            } else if (pressed == BTN_SOUTH) {
+                if (cursor_row == 0 && window_top + 1 < MENU_COUNT) {
+                    cursor_row = 1;
+                } else if (window_top + 2 < MENU_COUNT) {
+                    window_top++;
+                }
+            } else if (pressed == BTN_SET) {
+                unsigned char selected = window_top + cursor_row;
+                lcd_clear();
+                switch (selected) {
+                    case MENU_TRACK:     state = ST_TRACK;         break;
+                    case MENU_JOG:       state = ST_JOG;           break;
+                    case MENU_CALIBRATE: state = ST_CAL;           break;
+                    case MENU_BLASH:
+                        state = ST_BTEST;
+                        btest_axis = CAL_AXIS_NS;
+                        btest_pulse_ms = 20;
+                        break;
+                    case MENU_SETTINGS:
+                        state = ST_SETTINGS;
+                        set_win_top = 0;
+                        set_cursor_r = 0;
+                        break;
+                    case MENU_VERSION:   state = ST_VERSION;       break;
+                    default: break;
+                }
+            } else if (pressed == BTN_QUIT) {
+                lcd_clear();
+                state = ST_IDLE;
+            } else if (idle_ticks >= INACTIVITY_LIMIT) {
+                lcd_clear();
+                state = ST_IDLE;
+            }
+            break;
+        }
+
+        case ST_TRACK:
+            track_tick(pressed, &state);
+            break;
+
+        case ST_STORM:
+            storm_tick(&state);
+            break;
+
+        case ST_CAL: {
+            /* Blocking sub-routine; takes 2-5 min to complete.  All relay
+             * safety is handled inside calibrate().  On return:
+             *   CAL_OK       -> config saved, advance to IDLE
+             *   CAL_ABORTED  -> user QUIT; relays already off; revert path
+             *                   depends on whether we had a prior config.
+             *   CAL_TIMEOUT  -> stroke exceeded 120 s; show error briefly.
+             */
+            cal_result_t r = calibrate();
+            /* Belt-and-suspenders: force-stop both axes in any exit. */
+            set_axis_ns(AXIS_OFF);
+            set_axis_ew(AXIS_OFF);
+
+            lcd_clear();
+            lcd_goto(0, 0);
+            switch (r) {
+                case CAL_OK:
+                    lcd_print_padded("Cal done", 16);
+                    lcd_goto(1, 0);
+                    lcd_print("NS=");
+                    lcd_print_secs_tenths((unsigned long)ns_stroke_ms);
+                    lcd_print(" EW=");
+                    lcd_print_secs_tenths((unsigned long)ew_stroke_ms);
+                    break;
+                case CAL_ABORTED:
+                    lcd_print_padded("Cal aborted", 16);
+                    break;
+                case CAL_TIMEOUT:
+                    lcd_print_padded("Cal timeout", 16);
+                    lcd_goto(1, 0); lcd_print_padded("check wiring", 16);
+                    break;
+            }
+            /* Hold result on screen for a moment so the user can see it. */
+            delay_ms(2000);
+            /* Cal ends at the retract endstop -> re-zero the integrator
+             * and re-arm the dt clock so the gap doesn't get credited
+             * to the next FWD/REV state. */
+            position_reset();
+            lcd_clear();
+            idle_ticks = 0;
+            prev_button = BTN_NONE;
+            state = ST_IDLE;
+            break;
+        }
+
+        case ST_BTEST: {
+            /* Backlash characterization: prime FWD then pulse REV by
+             * btest_pulse_ms, watching for visible motion.  The smallest
+             * pulse_ms that produces motion is the gear backlash time.
+             *
+             * Axis select: N/S keys -> NS axis, E/W keys -> EW axis.
+             * SET: run one prime+pulse cycle, then increment pulse_ms.
+             * QUIT: exit to menu.
+             *
+             * Position tracker is not updated during the test sequence
+             * (the prime FWD does move the actuator, but we re-arm
+             * pos_last_tick_ms afterward so it's not credited weirdly). */
+            const char *axis_lbl = (btest_axis == CAL_AXIS_NS) ? "NS" : "EW";
+
+            lcd_goto(0, 0);
+            lcd_print("Backlash ");
+            lcd_print(axis_lbl);
+            lcd_print("     ");   /* pad to 16 */
+
+            lcd_goto(1, 0);
+            lcd_print("Pulse:");
+            lcd_putc('0' + (btest_pulse_ms / 100));
+            lcd_putc('0' + ((btest_pulse_ms / 10) % 10));
+            lcd_putc('0' + (btest_pulse_ms % 10));
+            lcd_print(" ms     ");
+
+            if (pressed == BTN_NORTH || pressed == BTN_SOUTH) {
+                btest_axis = CAL_AXIS_NS;
+            } else if (pressed == BTN_EAST || pressed == BTN_WEST) {
+                btest_axis = CAL_AXIS_EW;
+            } else if (pressed == BTN_SET) {
+                /* Prime FWD 500 ms -- comfortably above expected backlash. */
+                lcd_clear();
+                lcd_goto(0, 0); lcd_print_padded("Priming FWD...", 16);
+                cal_axis_set(btest_axis, AXIS_FWD);
+                delay_ms(500);
+                cal_axis_set(btest_axis, AXIS_OFF);
+                delay_ms(300);
+
+                /* REV pulse of pulse_ms. */
+                lcd_goto(0, 0); lcd_print_padded("REV pulse...", 16);
+                cal_axis_set(btest_axis, AXIS_REV);
+                delay_ms(btest_pulse_ms);
+                cal_axis_set(btest_axis, AXIS_OFF);
+                delay_ms(500);
+
+                btest_pulse_ms += 20;
+                if (btest_pulse_ms > 999) btest_pulse_ms = 20;
+                lcd_clear();
+                pos_last_tick_ms = millis();   /* re-arm tick */
+            } else if (pressed == BTN_QUIT) {
+                cal_axis_set(btest_axis, AXIS_OFF);  /* belt + suspenders */
+                lcd_clear();
+                state = ST_MENU;
+            }
+            break;
+        }
+
+        case ST_JOG:
+            jog_tick(pressed, curr_button,
+                     (idle_ticks >= INACTIVITY_LIMIT) ? 1 : 0, &state);
+            break;
+
+        case ST_SETTINGS:
+            settings_list_tick(pressed, &state);
+            break;
+
+        case ST_SETTINGS_EDIT:
+            settings_edit_tick(pressed, &state);
+            break;
+
+        case ST_VERSION:
+            lcd_goto(0, 0); lcd_print_padded(FIRMWARE_VERSION, 16);
+            lcd_goto(1, 0); lcd_print_padded(build_date, 16);
+            if (pressed == BTN_QUIT) {
+                lcd_clear();
+                state = ST_MENU;
+            }
+            break;
         }
 
         delay_ms(50);

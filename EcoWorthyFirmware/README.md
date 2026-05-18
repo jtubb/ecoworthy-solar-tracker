@@ -31,6 +31,17 @@ make            # produce build/ecoworthy.ihx
 make clean      # remove build/
 ```
 
+The Makefile builds with `--stack-auto` (reentrant calling convention).
+This is **required**, not optional: the state-machine + helper call graph
+exceeds SDCC's default 128-byte internal-RAM overlay budget, and the
+reentrant model relocates function locals to the internal stack. The
+Makefile also passes an explicit `--lib-path` to the bundled
+`small-stack-auto` libraries because SDCC didn't auto-resolve that
+model's lib directory on the development Windows install — adjust the
+path if your SDCC lives elsewhere. Removing `--stack-auto` resurrects
+the `?ASlink-Error-Could not get NNN consecutive bytes ... DSEG` link
+failure.
+
 ## Flash
 
 stcgal speaks the STC ISP protocol over UART. The chip's bootloader only listens
@@ -74,18 +85,32 @@ fight the USB-TTL adapter on the shared wire. This is why fast power-cycling
 and an immediately-ready stcgal matter: miss the bootloader window and the
 contention starts.
 
-## What Phase 0 firmware does
+## What the firmware does (Phases 0–2C)
 
-`main.c` performs:
-1. Relay-safe boot — every relay pin and the buzzer forced LOW before
-   anything else runs.
-2. Configures relays, buzzer, and LCD pins as push-pull outputs.
-3. Initializes the HD44780 LCD with the standard 8-bit wake-up sequence.
-4. Displays `EcoWorthy` on line 1 and `Phase 0 OK` on line 2.
-5. Idles in an infinite empty loop.
+`main.c` boots relay-safe (all relays + buzzer forced LOW), configures
+ports, inits the HD44780 LCD, starts a 1 kHz Timer 0 `millis()` tick,
+loads EEPROM config, and runs boot auto-zero if calibrated. Then a
+50 ms state-machine main loop:
 
-No relays activate. No buzzer sounds. The LCD message confirms the chip is
-running custom firmware.
+- **Idle** — live sun/wind readout; SET enters the menu.
+- **Menu** — scrolling no-wrap list: Track / Jog / Calibrate / Backlash
+  / Settings / Version. Buttons are a debounced analog resistor ladder.
+- **Calibrate** — per axis: bump-off, retract-to-stall (zero), then
+  timed extend + timed retract; stores `max(extend, retract)` with the
+  extend stall-delay subtracted. Stall = dI signature on the
+  soft-Zener rail-droop sense (see `../CLAUDE.md` quirk 6).
+- **Jog** — manual axis control; SET saves current position as the
+  horizontal reference (% of stroke) to EEPROM.
+- **Track** — differential sun-sensor pulse-tracker (8-sample averaged,
+  configurable threshold), per-axis 2-min/18-min duty limiting.
+- **Storm** — wind ≥ threshold forces park-to-horizontal, then holds
+  with a resettable dwell timer before auto-returning to Track.
+- **Settings** — EEPROM-persisted: wind storm/release, storm dwell,
+  track threshold. Press-and-hold auto-repeats value edits.
+
+Position is tracked by integrating relay on-time, saturated to the
+calibrated stroke. Duty + storm interlocks run every loop iteration
+regardless of mode.
 
 ## Debugging notes
 
