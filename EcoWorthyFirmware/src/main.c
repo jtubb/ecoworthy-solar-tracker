@@ -1702,13 +1702,13 @@ static void uart_status_send(state_t st) {
 }
 
 /* Parse decimal digits from p; return value and advance *p past them.
- * Returns -1 on no-digits.  Caps at 999 to bound. */
+ * Returns -1 on no-digits.  Caps at 9999 to bound. */
 static int parse_u_advance(const char **p) {
     int v = 0;
     int saw = 0;
     while (**p >= '0' && **p <= '9') {
         v = v * 10 + (**p - '0');
-        if (v > 999) v = 999;
+        if (v > 9999) v = 9999;
         (*p)++;
         saw = 1;
     }
@@ -1812,6 +1812,7 @@ static void uart_cmd_dispatch(state_t *state) {
     /* !cal -- trigger calibration (only from IDLE, not in storm) */
     if (strncmp(p + 1, "cal", 3) == 0 && p[4] == '\0') {
         if (*state == ST_IDLE && !storm_forced) {
+            goto_active = 0;     /* cancel any pending goto */
             *state = ST_CAL;
         }
         return;
@@ -2172,6 +2173,7 @@ void main(void) {
          * of stroke.  Stops each axis when within ~1% of target.
          * Clears goto_active when both axes reach. */
         if (goto_active) {
+            /* az drives E/W rotation; el drives N/S tilt (CLAUDE.md quirk 5). */
             unsigned long tgt_ns_ms = (unsigned long)goto_el_target_pct * ns_stroke_ms / 100UL;
             unsigned long tgt_ew_ms = (unsigned long)goto_az_target_pct * ew_stroke_ms / 100UL;
             unsigned char ns_done = 0, ew_done = 0;
