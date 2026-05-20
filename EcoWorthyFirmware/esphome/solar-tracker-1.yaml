@@ -59,11 +59,17 @@ external_components:
   # Raw TCP<->UART for debugging the wire when needed.
   - source: github://oxan/esphome-stream-server
     refresh: 0s
-  # Local Phase 3 bridge component (under ./components/tracker_bridge/).
+  # Phase 3 bridge component, fetched from the project repo on each
+  # build (refresh: 0s -> never cached).  Note `path:` -- the component
+  # lives under EcoWorthyFirmware/esphome/components/, not the ESPHome
+  # default lookup path of <repo-root>/esphome/components/.
   - source:
-      type: local
-      path: components
+      type: git
+      url: https://github.com/jtubb/ecoworthy-solar-tracker
+      ref: master
+      path: EcoWorthyFirmware/esphome/components
     components: [tracker_bridge]
+    refresh: 0s
 
 uart:
   id: uart_bus
