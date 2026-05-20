@@ -501,6 +501,8 @@ static void config_valid_refresh(void) { cfg_valid = config_is_valid(); }
  *   9     : wind_release_mps -- release storm dwell below this speed
  *   10    : storm_dwell_min -- minutes wind must stay below release
  *   11    : track_thresh -- sun differential ADC counts to trigger a move
+ *   12    : role (1=primary, 2=secondary)
+ *   13    : wind_source (0=local, 1=remote)
  */
 static unsigned int ns_stroke_ms = 0;
 static unsigned int ew_stroke_ms = 0;
@@ -510,6 +512,8 @@ static unsigned char wind_storm_mps   = 15;
 static unsigned char wind_release_mps = 10;
 static unsigned char storm_dwell_min  = 10;
 static unsigned char track_thresh     = 3;
+static unsigned char role           = 2;   /* 1=primary, 2=secondary */
+static unsigned char wind_source    = 0;   /* 0=local, 1=remote */
 
 /* Setting range bounds.  Used by ST_SETTINGS_EDIT for clamping and
  * by config_load() for sanity-checking unprogrammed EEPROM bytes. */
@@ -521,6 +525,10 @@ static unsigned char track_thresh     = 3;
 #define DWELL_MIN_MAX    60
 #define TRACK_THRESH_MIN  1
 #define TRACK_THRESH_MAX 99
+#define ROLE_MIN          1
+#define ROLE_MAX          2
+#define WIND_SOURCE_MIN   0
+#define WIND_SOURCE_MAX   1
 
 static unsigned int iap_read_u16(unsigned int addr) {
     unsigned int lo = iap_read_byte(addr);
@@ -538,6 +546,8 @@ static void config_load(void) {
     wind_release_mps = iap_read_byte(EEPROM_BASE + 9);
     storm_dwell_min  = iap_read_byte(EEPROM_BASE + 10);
     track_thresh     = iap_read_byte(EEPROM_BASE + 11);
+    role        = iap_read_byte(EEPROM_BASE + 12);
+    wind_source = iap_read_byte(EEPROM_BASE + 13);
     if (horiz_ns_pct > 100) horiz_ns_pct = 50;
     if (horiz_ew_pct > 100) horiz_ew_pct = 50;
     /* Reject unprogrammed (0xFF) and out-of-range; revert to defaults. */
@@ -549,6 +559,8 @@ static void config_load(void) {
         storm_dwell_min = 10;
     if (track_thresh < TRACK_THRESH_MIN || track_thresh > TRACK_THRESH_MAX)
         track_thresh = 3;
+    if (role < ROLE_MIN || role > ROLE_MAX) role = 2;             /* default secondary */
+    if (wind_source > WIND_SOURCE_MAX) wind_source = 0;           /* default local */
     /* Invariant: release threshold must be strictly less than storm threshold. */
     if (wind_release_mps >= wind_storm_mps)
         wind_release_mps = (wind_storm_mps > 0) ? wind_storm_mps - 1 : 0;
@@ -573,6 +585,8 @@ static void config_save(void) {
     iap_program_byte(EEPROM_BASE + 9, wind_release_mps);
     iap_program_byte(EEPROM_BASE + 10, storm_dwell_min);
     iap_program_byte(EEPROM_BASE + 11, track_thresh);
+    iap_program_byte(EEPROM_BASE + 12, role);
+    iap_program_byte(EEPROM_BASE + 13, wind_source);
     config_valid_refresh();   /* config now persisted -> cache fresh */
 }
 
