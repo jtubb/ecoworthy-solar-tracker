@@ -2230,6 +2230,15 @@ void main(void) {
 #endif
     config_load();        /* pull stroke times + horizontal from EEPROM if cal'd */
 
+    /* Defense: explicitly zero Phase-4 state that lives in XISEG. If SDCC's
+     * XDATA init runtime misses these (or if a quick power-cycle leaves
+     * stale SRAM values), starting with non-zero storm_forced/goto/remote
+     * bits would falsely re-enter storm or fire stale gotos at boot. */
+    storm_forced = 0;
+    remote_wind_mps = 0;
+    remote_wind_last_update_ms = 0;
+    goto_active = 0;
+
     /* Capture stall-current baseline with all relays guaranteed OFF.
      * Used by jog dI display and (re-captured) by calibration. */
     delay_ms(200);
