@@ -85,7 +85,7 @@ fight the USB-TTL adapter on the shared wire. This is why fast power-cycling
 and an immediately-ready stcgal matter: miss the bootloader window and the
 contention starts.
 
-## What the firmware does (Phases 0–2C)
+## What the firmware does (Phases 0–3)
 
 `main.c` boots relay-safe (all relays + buzzer forced LOW), configures
 ports, inits the HD44780 LCD, starts a 1 kHz Timer 0 `millis()` tick,
@@ -110,7 +110,22 @@ loads EEPROM config, and runs boot auto-zero if calibrated. Then a
 
 Position is tracked by integrating relay on-time, saturated to the
 calibrated stroke. Duty + storm interlocks run every loop iteration
-regardless of mode.
+regardless of mode. A custom LCD glyph (CGRAM 0 — padlock) overlays
+the bottom-right cell whenever an axis is duty-locked; cleared at
+boot, forced after calibration (motor thermal protection).
+
+### Phase 3: half-duplex single-wire HA bridge
+
+Pin 17 (P3.2, INT0) hosts a bit-banged half-duplex 9600 8N1 link to
+an ESP-01S running ESPHome. Timer 1 paces TX bits and samples
+INT0-triggered RX mid-bit (no polling). Wire framing is
+`\xAA\x55 <ASCII payload> <2-hex CRC8> \n` with CRC-8/SMBUS over the
+payload bytes. The ESP polls `?` every 2 s; the STC replies with
+`az=NN el=NN wind=NN mode=XXX`. The ESP-side custom component
+(`tracker_bridge`, at `<repo>/esphome/components/`) parses the same
+framing and publishes the four fields to Home Assistant. Reference
+YAML at `esphome/solar-tracker-1.yaml`. Read-only in v1 — HA→STC
+commands are deferred to a future phase.
 
 ## Debugging notes
 
