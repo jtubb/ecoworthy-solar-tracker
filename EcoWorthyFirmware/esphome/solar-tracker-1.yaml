@@ -60,14 +60,9 @@ external_components:
   - source: github://oxan/esphome-stream-server
     refresh: 0s
   # Phase 3 bridge component, fetched from the project repo on each
-  # build (refresh: 0s -> never cached).  Note `path:` -- the component
-  # lives under EcoWorthyFirmware/esphome/components/, not the ESPHome
-  # default lookup path of <repo-root>/esphome/components/.
-  - source:
-      type: git
-      url: https://github.com/jtubb/ecoworthy-solar-tracker
-      ref: master
-      path: EcoWorthyFirmware/esphome/components
+  # build.  Lives at <repo-root>/esphome/components/tracker_bridge/
+  # (ESPHome's canonical lookup path; it doesn't accept a custom path).
+  - source: github://jtubb/ecoworthy-solar-tracker
     components: [tracker_bridge]
     refresh: 0s
 
