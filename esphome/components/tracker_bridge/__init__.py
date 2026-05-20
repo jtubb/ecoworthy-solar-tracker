@@ -21,6 +21,7 @@ from esphome.const import CONF_ID
 CODEOWNERS = ["@jtubb"]
 DEPENDENCIES = ["uart"]
 MULTI_CONF = True
+LIBRARIES = ["rweather/Cryptography@^0.4.0"]  # AES-CCM; verify name on first compile
 
 tracker_bridge_ns = cg.esphome_ns.namespace("tracker_bridge")
 TrackerBridge = tracker_bridge_ns.class_(
@@ -29,8 +30,21 @@ TrackerBridge = tracker_bridge_ns.class_(
 
 CONF_TRACKER_BRIDGE_ID = "tracker_bridge_id"
 
+# --- Phase 4: mesh config keys ---
+CONF_MESH = "mesh"
+CONF_CHANNEL = "channel"
+CONF_PSK = "psk"
+CONF_TRACKER_ID = "tracker_id"
+
 CONFIG_SCHEMA = (
-    cv.Schema({cv.GenerateID(): cv.declare_id(TrackerBridge)})
+    cv.Schema({
+        cv.GenerateID(): cv.declare_id(TrackerBridge),
+        cv.Optional(CONF_MESH): cv.Schema({
+            cv.Required(CONF_CHANNEL): cv.int_range(min=1, max=13),
+            cv.Required(CONF_PSK): cv.string,   # 16-byte hex or passphrase
+            cv.Required(CONF_TRACKER_ID): cv.string_strict,
+        }),
+    })
     .extend(cv.COMPONENT_SCHEMA)
     .extend(uart.UART_DEVICE_SCHEMA)
 )
@@ -40,3 +54,8 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
+    if CONF_MESH in config:
+        mesh = config[CONF_MESH]
+        cg.add(var.set_mesh_channel(mesh[CONF_CHANNEL]))
+        cg.add(var.set_mesh_psk(mesh[CONF_PSK]))
+        cg.add(var.set_tracker_id(mesh[CONF_TRACKER_ID]))

@@ -1,17 +1,19 @@
-# Solar tracker 1 -- ESP-01S half-duplex bridge to the STC15 board.
+# Solar tracker 2 -- ESP-01S half-duplex bridge to the STC15 board.
 #
-# This is the maintained reference YAML for the bridge.  Sync to the
-# ESPHome dashboard (or run `esphome run` directly).  Secrets live
-# alongside as usual (wifi_ssid, wifi_password, ha_api_key,
-# ota_password, fallback_password).
+# Secondary node in the Phase 4 mesh.  Identical to solar-tracker-1
+# except for device name, static IP, and tracker_id.  The mesh channel
+# and PSK must match tracker-1's values exactly.
 #
-# v1 is read-only: the bridge polls the STC every 2 s and publishes
-# az / el / wind / mode to HA.  Phase 4 will add multi-tracker mesh
-# (ESP-NOW broadcast) so a primary can drive secondaries into storm.
+# To validate ESP-NOW: flash this to a spare ESP-01S, power both nodes,
+# and watch the ESPHome logs.  With MESH_TEST_BROADCAST=1 (set at
+# compile time in tracker_bridge.h) you should see:
+#   tracker-1 log: "test broadcast sent (MESH_TEST_BROADCAST=1)"
+#   tracker-2 log: "mesh rx type=99 from XX:XX:XX:XX:XX:XX plen=2"
+# and vice-versa.  If you see "AES auth fail", the PSKs differ.
 
 substitutions:
-  device_name: solar-tracker-1
-  friendly_name: "Solar Tracker 1"
+  device_name: solar-tracker-2
+  friendly_name: "Solar Tracker 2"
 
 esphome:
   name: ${device_name}
@@ -40,7 +42,7 @@ wifi:
   # Both must agree; change together.
   channel: 6
   manual_ip:
-    static_ip: 192.168.1.193
+    static_ip: 192.168.1.194
     gateway: 192.168.1.254
     subnet: 255.255.255.0
     dns1: 192.168.50.1
@@ -62,9 +64,8 @@ external_components:
   # Raw TCP<->UART for debugging the wire when needed.
   - source: github://oxan/esphome-stream-server
     refresh: 0s
-  # Phase 3 bridge component, fetched from the project repo on each
+  # Phase 3/4 bridge component, fetched from the project repo on each
   # build.  Lives at <repo-root>/esphome/components/tracker_bridge/
-  # (ESPHome's canonical lookup path; it doesn't accept a custom path).
   - source: github://jtubb/ecoworthy-solar-tracker
     components: [tracker_bridge]
     refresh: 0s
@@ -89,7 +90,7 @@ tracker_bridge:
   mesh:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
-    tracker_id: "T1"
+    tracker_id: "T2"
 
 stream_server:
   uart_id: uart_bus
