@@ -1552,8 +1552,23 @@ static void storm_check(state_t *state) {
     /* Always sample + cache wind (UI uses the cache).  Storm action is
      * gated below; the cache update is unconditional so jog/idle still
      * see live wind even when uncalibrated or already storming. */
-    w = wind_mps(adc_read_avg(ADC_CH_WIND, 8));
-    wind_mps_cached = w;
+    if (wind_source == 0) {
+        /* Local: read sensor as before */
+        w = wind_mps(adc_read_avg(ADC_CH_WIND, 8));
+        wind_mps_cached = w;
+    } else {
+        /* Remote: use cached value from !wind= broadcast.
+         * Failsafe: if no update in REMOTE_WIND_TIMEOUT_MS, force storm. */
+        unsigned long age = now - remote_wind_last_update_ms;
+        if (remote_wind_last_update_ms == 0 || age > REMOTE_WIND_TIMEOUT_MS) {
+            /* No broadcast yet, or stale: force storm */
+            storm_forced = 1;
+            w = wind_storm_mps;   /* report at-threshold so storm logic proceeds */
+        } else {
+            w = remote_wind_mps;
+            wind_mps_cached = w;  /* mirror to display */
+        }
+    }
 
     if (*state == ST_STORM) return;
     if (!cfg_valid) return;
