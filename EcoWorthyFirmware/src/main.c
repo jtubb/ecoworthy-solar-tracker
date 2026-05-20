@@ -1324,6 +1324,8 @@ typedef enum {
     SET_WIND_RELEASE,
     SET_STORM_DWELL,
     SET_TRACK_THRESH,
+    SET_ROLE,              /* new */
+    SET_WIND_SOURCE,       /* new */
     SET_COUNT
 } setting_t;
 
@@ -1340,6 +1342,8 @@ static const setting_def_t setting_defs[SET_COUNT] = {
     { "W.Rel",    "Wind release",   "m/s", WIND_RELEASE_MIN, WIND_RELEASE_MAX },
     { "S.Dwell",  "Storm dwell",    "min", DWELL_MIN_MIN,    DWELL_MIN_MAX    },
     { "TrkThr",   "Track thresh",   "adc", TRACK_THRESH_MIN, TRACK_THRESH_MAX },
+    { "Role",     "Role 1=P 2=S",   "",    ROLE_MIN,         ROLE_MAX         },
+    { "WSrc",     "Wind src 0L 1R", "",    WIND_SOURCE_MIN,  WIND_SOURCE_MAX  },
 };
 
 static unsigned char setting_get(setting_t s) {
@@ -1348,6 +1352,8 @@ static unsigned char setting_get(setting_t s) {
         case SET_WIND_RELEASE: return wind_release_mps;
         case SET_STORM_DWELL:  return storm_dwell_min;
         case SET_TRACK_THRESH: return track_thresh;
+        case SET_ROLE:         return role;            /* new */
+        case SET_WIND_SOURCE:  return wind_source;     /* new */
         default:               return 0;
     }
 }
@@ -1358,6 +1364,8 @@ static void setting_set(setting_t s, unsigned char v) {
         case SET_WIND_RELEASE: wind_release_mps = v; break;
         case SET_STORM_DWELL:  storm_dwell_min  = v; break;
         case SET_TRACK_THRESH: track_thresh     = v; break;
+        case SET_ROLE:         role             = v; break;   /* new */
+        case SET_WIND_SOURCE:  wind_source      = v; break;   /* new */
         default: break;
     }
 }
