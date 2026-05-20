@@ -756,6 +756,10 @@ static __xdata unsigned long duty_last_tick_ms = 0;
  * the button channel never gets contaminated by per-loop mux switches. */
 static __xdata unsigned char wind_mps_cached = 0;
 
+static __xdata unsigned char remote_wind_mps = 0;
+static __xdata unsigned long remote_wind_last_update_ms = 0;
+#define REMOTE_WIND_TIMEOUT_MS 20000UL   /* Q5 failsafe: 4 missed 5s broadcasts */
+
 /* ---- Storm interlock (Phase 2C-9) ----
  * High wind forces ST_STORM: drive to the saved horizontal position
  * (PARKING), then hold there (HOLDING) until wind has stayed below
@@ -967,6 +971,9 @@ static __xdata int           track_dE = 0;
 static __xdata unsigned long track_last_check_ms = 0;
 static __xdata unsigned long ns_pulse_end_ms = 0;
 static __xdata unsigned long ew_pulse_end_ms = 0;
+static __xdata unsigned char goto_az_target_pct = 0;
+static __xdata unsigned char goto_el_target_pct = 0;
+static __xdata unsigned char goto_active = 0;
 /* track_tick() is defined after the state_t enum (it mutates state). */
 
 /* ---- Calibration ----
@@ -1694,6 +1701,20 @@ static void uart_status_send(state_t st) {
     uart_send_frame(buf);
 }
 
+/* Parse decimal digits from p; return value and advance *p past them.
+ * Returns -1 on no-digits.  Caps at 999 to bound. */
+static int parse_u_advance(const char **p) {
+    int v = 0;
+    int saw = 0;
+    while (**p >= '0' && **p <= '9') {
+        v = v * 10 + (**p - '0');
+        if (v > 999) v = 999;
+        (*p)++;
+        saw = 1;
+    }
+    return saw ? v : -1;
+}
+
 /* Dispatch a validated framed payload.  ? = status request; ! =
  * command (sub-parsed by token).  Other payloads are dropped. */
 static void uart_cmd_dispatch(state_t *state) {
@@ -1715,7 +1736,86 @@ static void uart_cmd_dispatch(state_t *state) {
         storm_forced = 0;
         return;
     }
-    /* Other ! commands implemented in Task 4. */
+
+    /* !wind=NN -- remote wind update from gateway */
+    if (strncmp(p + 1, "wind=", 5) == 0) {
+        const char *q = p + 6;
+        int v = parse_u_advance(&q);
+        if (v >= 0) {
+            remote_wind_mps = (v > 99) ? 99 : (unsigned char)v;
+            remote_wind_last_update_ms = millis();
+        }
+        return;
+    }
+
+    /* !stop -- emergency stop both axes */
+    if (strncmp(p + 1, "stop", 4) == 0 && p[5] == '\0') {
+        set_axis_ns(AXIS_OFF);
+        set_axis_ew(AXIS_OFF);
+        ns_pulse_end_ms = 0;
+        ew_pulse_end_ms = 0;
+        goto_active = 0;
+        return;
+    }
+
+    /* !goto az=NN el=NN -- goto position percentages.
+     * Respects storm/duty interlocks; clamps to [0,100]. */
+    if (strncmp(p + 1, "goto ", 5) == 0) {
+        int az_v = -1, el_v = -1;
+        const char *q = p + 6;
+        while (*q) {
+            if (q[0] == 'a' && q[1] == 'z' && q[2] == '=') { q += 3; az_v = parse_u_advance(&q); }
+            else if (q[0] == 'e' && q[1] == 'l' && q[2] == '=') { q += 3; el_v = parse_u_advance(&q); }
+            else if (*q == ' ') q++;
+            else q++;
+        }
+        if (az_v < 0 || el_v < 0) return;
+        if (az_v > 100) az_v = 100;
+        if (el_v > 100) el_v = 100;
+        if (*state == ST_STORM || ns_duty_locked() || ew_duty_locked()) return;
+        goto_az_target_pct = (unsigned char)az_v;
+        goto_el_target_pct = (unsigned char)el_v;
+        goto_active = 1;
+        return;
+    }
+
+    /* !jog ax=N dir=+/- ms=NNN -- timed pulse on one axis */
+    if (strncmp(p + 1, "jog ", 4) == 0) {
+        const char *q = p + 5;
+        int ax = -1, dir_pos = -1, dur_ms = -1;
+        while (*q) {
+            if (q[0] == 'a' && q[1] == 'x' && q[2] == '=') { q += 3; ax = parse_u_advance(&q); }
+            else if (q[0] == 'd' && q[1] == 'i' && q[2] == 'r' && q[3] == '=') {
+                q += 4;
+                if (*q == '+') { dir_pos = 1; q++; }
+                else if (*q == '-') { dir_pos = 0; q++; }
+            }
+            else if (q[0] == 'm' && q[1] == 's' && q[2] == '=') { q += 3; dur_ms = parse_u_advance(&q); }
+            else if (*q == ' ') q++;
+            else q++;
+        }
+        if (ax < 0 || dir_pos < 0 || dur_ms < 0) return;
+        if (dur_ms > 2500) dur_ms = 2500;
+        if (*state == ST_STORM) return;
+        if (ax == 0) {
+            if (ns_duty_locked()) return;
+            set_axis_ns(dir_pos ? AXIS_FWD : AXIS_REV);
+            ns_pulse_end_ms = millis() + (unsigned long)dur_ms;
+        } else if (ax == 1) {
+            if (ew_duty_locked()) return;
+            set_axis_ew(dir_pos ? AXIS_FWD : AXIS_REV);
+            ew_pulse_end_ms = millis() + (unsigned long)dur_ms;
+        }
+        return;
+    }
+
+    /* !cal -- trigger calibration (only from IDLE, not in storm) */
+    if (strncmp(p + 1, "cal", 3) == 0 && p[4] == '\0') {
+        if (*state == ST_IDLE && !storm_forced) {
+            *state = ST_CAL;
+        }
+        return;
+    }
 }
 
 /* Drain RX through the frame parser; on a valid framed payload,
@@ -2067,6 +2167,39 @@ void main(void) {
          * BEFORE any code that mutates ns_state / ew_state so the dt is
          * credited to the right state. */
         position_tick();
+
+        /* HA goto: drive both axes toward goto_*_target_pct in percent
+         * of stroke.  Stops each axis when within ~1% of target.
+         * Clears goto_active when both axes reach. */
+        if (goto_active) {
+            unsigned long tgt_ns_ms = (unsigned long)goto_el_target_pct * ns_stroke_ms / 100UL;
+            unsigned long tgt_ew_ms = (unsigned long)goto_az_target_pct * ew_stroke_ms / 100UL;
+            unsigned char ns_done = 0, ew_done = 0;
+            if (ns_state == AXIS_OFF) {
+                if ((unsigned long)ns_pos_ms + 200 < tgt_ns_ms) set_axis_ns(AXIS_FWD);
+                else if ((unsigned long)ns_pos_ms > tgt_ns_ms + 200) set_axis_ns(AXIS_REV);
+                else ns_done = 1;
+            } else {
+                if (ns_state == AXIS_FWD && (unsigned long)ns_pos_ms >= tgt_ns_ms) { set_axis_ns(AXIS_OFF); ns_done = 1; }
+                if (ns_state == AXIS_REV && (unsigned long)ns_pos_ms <= tgt_ns_ms) { set_axis_ns(AXIS_OFF); ns_done = 1; }
+            }
+            if (ew_state == AXIS_OFF) {
+                if ((unsigned long)ew_pos_ms + 200 < tgt_ew_ms) set_axis_ew(AXIS_FWD);
+                else if ((unsigned long)ew_pos_ms > tgt_ew_ms + 200) set_axis_ew(AXIS_REV);
+                else ew_done = 1;
+            } else {
+                if (ew_state == AXIS_FWD && (unsigned long)ew_pos_ms >= tgt_ew_ms) { set_axis_ew(AXIS_OFF); ew_done = 1; }
+                if (ew_state == AXIS_REV && (unsigned long)ew_pos_ms <= tgt_ew_ms) { set_axis_ew(AXIS_OFF); ew_done = 1; }
+            }
+            if (ns_done && ew_done) goto_active = 0;
+            /* Storm or duty lockout cancels the goto */
+            if (state == ST_STORM || ns_duty_locked() || ew_duty_locked()) {
+                goto_active = 0;
+                set_axis_ns(AXIS_OFF);
+                set_axis_ew(AXIS_OFF);
+            }
+        }
+
         duty_tick();   /* enforce motor on-time limit regardless of mode */
         storm_check(&state);  /* wind watchdog -- may force ST_STORM */
 
