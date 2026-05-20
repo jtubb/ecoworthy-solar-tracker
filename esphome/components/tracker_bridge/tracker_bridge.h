@@ -254,7 +254,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* Derive a 16-byte AES key from the passphrase via SHA1 truncation.
      * Deterministic: operators can use a human-readable string in YAML. */
     SHA1 sha;
-    sha.update(reinterpret_cast<const void *>(mesh_psk_.data()), mesh_psk_.size());
+    sha.update(mesh_psk_.data(), mesh_psk_.size());
     uint8_t digest[20];
     sha.finalize(digest, sizeof(digest));
     memcpy(mesh_key_, digest, 16);
@@ -274,19 +274,28 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       return;
     }
     esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
-    esp_now_register_recv_cb([](uint8_t *mac, uint8_t *data, uint8_t len) {
-      /* Static C callback -- dispatch to singleton instance. */
-      if (TrackerBridge::instance_ != nullptr)
-        TrackerBridge::instance_->mesh_rx_(mac, data, len);
-    });
+
+    /* Set instance_ BEFORE registering the callback so there is no window
+     * in which the callback fires with a null instance_. */
+    instance_ = this;
+    esp_now_register_recv_cb(recv_cb_);
 
     /* Register broadcast peer (FF:FF:FF:FF:FF:FF). */
     uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_now_add_peer(bcast, ESP_NOW_ROLE_SLAVE, mesh_channel_, NULL, 0);
-
-    instance_ = this;
     ESP_LOGI(TAG, "Mesh enabled: channel=%u tracker_id=%s",
              mesh_channel_, tracker_id_.c_str());
+  }
+
+  /* ---- recv_cb_: IRAM-resident ESP-NOW receive callback entry point ----
+   * ESP8266 NONOS SDK fires this from an interrupt-adjacent context that
+   * requires the function to reside in IRAM (ICACHE_RAM_ATTR).  A capturing
+   * lambda cannot carry that attribute and would be placed in flash,
+   * risking a cache-stall panic.  This thin stub lives in IRAM and
+   * dispatches to mesh_rx_() which may remain in flash. */
+  static void ICACHE_RAM_ATTR recv_cb_(uint8_t *mac, uint8_t *data, uint8_t len) {
+    if (TrackerBridge::instance_)
+      TrackerBridge::instance_->mesh_rx_(mac, data, len);
   }
 
   /* ---- mesh_tx_: encrypt + broadcast a single mesh frame ---- */
@@ -302,6 +311,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * counter is detected by the tag check.
    */
   void mesh_tx_(uint8_t type, const uint8_t *payload_in, size_t plen) {
+    /* Guard: pkt is sized for at most 64 bytes of plaintext. */
+    if (plen > 64) {
+      ESP_LOGE(TAG, "mesh_tx_ plen %u > 64", (unsigned)plen);
+      return;
+    }
     /* Maximum ESP-NOW payload is 250 bytes; 11 header + 8 tag = 19 bytes
      * of overhead, leaving 231 bytes for plaintext.  64 is well within. */
     uint8_t pkt[1 + 6 + 4 + 64 + 8];

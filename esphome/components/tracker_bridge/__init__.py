@@ -21,7 +21,7 @@ from esphome.const import CONF_ID
 CODEOWNERS = ["@jtubb"]
 DEPENDENCIES = ["uart"]
 MULTI_CONF = True
-LIBRARIES = ["rweather/Cryptography@^0.4.0"]  # AES-CCM; verify name on first compile
+LIBRARIES = ["rweather/Cryptography==0.4.0"]  # AES-CCM; pinned for reproducible builds
 
 tracker_bridge_ns = cg.esphome_ns.namespace("tracker_bridge")
 TrackerBridge = tracker_bridge_ns.class_(
