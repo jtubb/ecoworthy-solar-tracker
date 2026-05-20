@@ -1,4 +1,5 @@
 #include "board.h"
+#include <string.h>
 
 static void delay_us(unsigned int us) {
     while (us--) {
@@ -768,6 +769,10 @@ static __xdata storm_phase_t storm_phase = STORM_PARKING;
 static __xdata unsigned long storm_dwell_start_ms = 0;
 static __xdata unsigned char storm_parking = 0;
 
+/* Operator-forced storm (via HA / mesh).  Independent of wind-based
+ * entry: when set, storm_check() forces ST_STORM regardless of wind. */
+static __xdata unsigned char storm_forced = 0;
+
 static unsigned char ns_duty_locked(void) { return ns_duty_lockout_end != 0; }
 static unsigned char ew_duty_locked(void) { return ew_duty_lockout_end != 0; }
 
@@ -1524,6 +1529,19 @@ static void storm_check(state_t *state) {
     if (now - storm_scan_last < STORM_SCAN_MS) return;
     storm_scan_last = now;
 
+    /* Forced storm: enter ST_STORM regardless of wind / cal state. */
+    if (storm_forced && *state != ST_STORM) {
+        ns_duty_on_ms = 0; ew_duty_on_ms = 0;
+        ns_duty_lockout_end = 0; ew_duty_lockout_end = 0;
+        duty_last_tick_ms = millis();
+        ns_pulse_end_ms = 0; ew_pulse_end_ms = 0;
+        storm_phase = STORM_PARKING;
+        storm_parking = 1;
+        lcd_clear();
+        *state = ST_STORM;
+        return;
+    }
+
     /* Always sample + cache wind (UI uses the cache).  Storm action is
      * gated below; the cache update is unconditional so jog/idle still
      * see live wind even when uncalibrated or already storming. */
@@ -1602,7 +1620,7 @@ static void storm_tick(state_t *state) {
         elapsed = now - storm_dwell_start_ms;
         need    = (unsigned long)storm_dwell_min * 60000UL;
 
-        if (elapsed >= need) {
+        if (elapsed >= need && !storm_forced) {
             lcd_clear();
             track_last_check_ms = millis();   /* fresh tracking eval */
             *state = ST_TRACK;
@@ -1676,14 +1694,36 @@ static void uart_status_send(state_t st) {
     uart_send_frame(buf);
 }
 
-/* Drain RX through the frame parser; on a valid bare-`?` poll, reply
- * with a status frame.  v1 read-only: any non-`?` payload is ignored
- * (no command surface).  Call once per main-loop iteration. */
-static void uart_service(state_t st) {
+/* Dispatch a validated framed payload.  ? = status request; ! =
+ * command (sub-parsed by token).  Other payloads are dropped. */
+static void uart_cmd_dispatch(state_t *state) {
+    const char *p = uart_frame_buf;
+
+    /* ? = status poll (existing behavior) */
+    if (p[0] == '?' && p[1] == '\0') {
+        uart_status_send(*state);
+        return;
+    }
+
+    /* !park / !release: set/clear the forced-storm flag */
+    if (p[0] != '!') return;
+    if (strncmp(p + 1, "park", 4) == 0 && p[5] == '\0') {
+        storm_forced = 1;
+        return;
+    }
+    if (strncmp(p + 1, "release", 7) == 0 && p[8] == '\0') {
+        storm_forced = 0;
+        return;
+    }
+    /* Other ! commands implemented in Task 4. */
+}
+
+/* Drain RX through the frame parser; on a valid framed payload,
+ * dispatch via uart_cmd_dispatch.  Call once per main-loop iteration. */
+static void uart_service(state_t *state) {
     uart_poll_frames();
     if (uart_frame_ready) {
-        if (uart_frame_buf[0] == '?' && uart_frame_buf[1] == '\0')
-            uart_status_send(st);
+        uart_cmd_dispatch(state);
         uart_frame_ready = 0;
     }
 }
@@ -2048,7 +2088,7 @@ void main(void) {
 #if P3_UART_ENABLE
         /* HA bridge: parse polls, reply with status.  Always runs;
          * fully non-blocking (parser + enqueue only). */
-        uart_service(state);
+        uart_service(&state);
 #endif
 #if P3_UART_ENABLE && P3_UART_STATUS_TEST
         {
