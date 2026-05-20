@@ -531,6 +531,25 @@ static unsigned char wind_source    = 0;   /* 0=local, 1=remote */
 #define WIND_SOURCE_MIN   0
 #define WIND_SOURCE_MAX   1
 
+/* Mesh config-protocol field IDs (see P4-6).  RW fields are operator
+ * tunables; RO fields are calibration/install data that should only
+ * be changed from the local UI. */
+#define CFG_F_WIND_STORM    0x01
+#define CFG_F_WIND_RELEASE  0x02
+#define CFG_F_STORM_DWELL   0x03
+#define CFG_F_TRACK_THRESH  0x04
+#define CFG_F_NS_STROKE     0x10
+#define CFG_F_EW_STROKE     0x11
+#define CFG_F_HORIZ_NS      0x12
+#define CFG_F_HORIZ_EW      0x13
+#define CFG_F_ROLE          0x20
+#define CFG_F_WIND_SOURCE   0x21
+
+#define CFG_STATUS_OK       0
+#define CFG_STATUS_RO       1
+#define CFG_STATUS_RANGE    2
+#define CFG_STATUS_UNKNOWN  3
+
 static unsigned int iap_read_u16(unsigned int addr) {
     unsigned int lo = iap_read_byte(addr);
     unsigned int hi = iap_read_byte(addr + 1);
@@ -1701,6 +1720,39 @@ static char *uart_app_u8(char *p, unsigned char v) {
     return p;
 }
 
+static char *uart_app_u16(char *p, unsigned int v) {
+    char tmp[6];
+    int n = 0;
+    if (v == 0) { *p++ = '0'; return p; }
+    while (v > 0) { tmp[n++] = '0' + (v % 10); v /= 10; }
+    while (n > 0) *p++ = tmp[--n];
+    return p;
+}
+
+static void uart_cfg_send_value(unsigned char field_id,
+                                unsigned int val_u16) {
+    static __xdata char buf[40];
+    char *p = buf;
+    p = uart_app_str(p, "cfg id=");
+    p = uart_app_u8(p, field_id);
+    p = uart_app_str(p, " val=");
+    p = uart_app_u16(p, val_u16);
+    *p = '\0';
+    uart_send_frame(buf);
+}
+
+static void uart_cfg_send_ack(unsigned char field_id,
+                              unsigned char status) {
+    static __xdata char buf[40];
+    char *p = buf;
+    p = uart_app_str(p, "cfg ack id=");
+    p = uart_app_u8(p, field_id);
+    p = uart_app_str(p, " st=");
+    p = uart_app_u8(p, status);
+    *p = '\0';
+    uart_send_frame(buf);
+}
+
 static void uart_status_send(state_t st) {
     static __xdata char buf[40];
     char *p = buf;
@@ -1830,6 +1882,71 @@ static void uart_cmd_dispatch(state_t *state) {
             goto_active = 0;     /* cancel any pending goto */
             *state = ST_CAL;
         }
+        return;
+    }
+
+    /* !cfg get id=NN -- read config field */
+    if (strncmp(p + 1, "cfg get id=", 11) == 0) {
+        const char *q = p + 12;
+        int id = parse_u_advance(&q);
+        if (id < 0) return;
+        switch (id) {
+            case CFG_F_WIND_STORM:    uart_cfg_send_value(id, wind_storm_mps); return;
+            case CFG_F_WIND_RELEASE:  uart_cfg_send_value(id, wind_release_mps); return;
+            case CFG_F_STORM_DWELL:   uart_cfg_send_value(id, storm_dwell_min); return;
+            case CFG_F_TRACK_THRESH:  uart_cfg_send_value(id, track_thresh); return;
+            case CFG_F_NS_STROKE:     uart_cfg_send_value(id, ns_stroke_ms); return;
+            case CFG_F_EW_STROKE:     uart_cfg_send_value(id, ew_stroke_ms); return;
+            case CFG_F_HORIZ_NS:      uart_cfg_send_value(id, horiz_ns_pct); return;
+            case CFG_F_HORIZ_EW:      uart_cfg_send_value(id, horiz_ew_pct); return;
+            case CFG_F_ROLE:          uart_cfg_send_value(id, role); return;
+            case CFG_F_WIND_SOURCE:   uart_cfg_send_value(id, wind_source); return;
+            default:                  uart_cfg_send_ack((unsigned char)id, CFG_STATUS_UNKNOWN); return;
+        }
+    }
+
+    /* !cfg set id=NN val=NN */
+    if (strncmp(p + 1, "cfg set id=", 11) == 0) {
+        const char *q = p + 12;
+        int id = parse_u_advance(&q);
+        if (id < 0) return;
+        /* Skip " val=" */
+        while (*q == ' ') q++;
+        if (q[0] != 'v' || q[1] != 'a' || q[2] != 'l' || q[3] != '=') return;
+        q += 4;
+        int val = parse_u_advance(&q);
+        if (val < 0) return;
+        unsigned char status = CFG_STATUS_OK;
+        switch (id) {
+            case CFG_F_WIND_STORM:
+                if (val < WIND_STORM_MIN || val > WIND_STORM_MAX) status = CFG_STATUS_RANGE;
+                else { wind_storm_mps = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_WIND_RELEASE:
+                if (val > WIND_RELEASE_MAX) status = CFG_STATUS_RANGE;
+                else { wind_release_mps = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_STORM_DWELL:
+                if (val < DWELL_MIN_MIN || val > DWELL_MIN_MAX) status = CFG_STATUS_RANGE;
+                else { storm_dwell_min = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_TRACK_THRESH:
+                if (val < TRACK_THRESH_MIN || val > TRACK_THRESH_MAX) status = CFG_STATUS_RANGE;
+                else { track_thresh = (unsigned char)val; config_save(); }
+                break;
+            /* All other fields read-only over mesh */
+            case CFG_F_NS_STROKE:
+            case CFG_F_EW_STROKE:
+            case CFG_F_HORIZ_NS:
+            case CFG_F_HORIZ_EW:
+            case CFG_F_ROLE:
+            case CFG_F_WIND_SOURCE:
+                status = CFG_STATUS_RO;
+                break;
+            default:
+                status = CFG_STATUS_UNKNOWN;
+        }
+        uart_cfg_send_ack((unsigned char)id, status);
         return;
     }
 }
