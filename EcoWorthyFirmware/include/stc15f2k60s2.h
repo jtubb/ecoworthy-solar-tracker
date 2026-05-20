@@ -67,11 +67,13 @@ __sfr __at (0xC5) IAP_CMD;
 __sfr __at (0xC6) IAP_TRIG;
 __sfr __at (0xC7) IAP_CONTR;
 
-/* ---- Timer 0 (used later for software-UART bit timing) ---- */
+/* ---- Timers 0 & 1 (T0 = 1 kHz millis tick; T1 = soft-UART bit clock) ---- */
 __sfr __at (0x88) TCON;
 __sfr __at (0x89) TMOD;
 __sfr __at (0x8A) TL0;
+__sfr __at (0x8B) TL1;
 __sfr __at (0x8C) TH0;
+__sfr __at (0x8D) TH1;
 
 /* ---- Interrupts ---- */
 __sfr __at (0xA8) IE;         /* EA, ELVD, EADC, ES, ET1, EX1, ET0, EX0 */

@@ -1,0 +1,150 @@
+# Solar tracker 1 -- ESP-01S half-duplex bridge to the STC15 board.
+#
+# This is the maintained reference YAML for the bridge.  Sync to the
+# ESPHome dashboard (or run `esphome run` directly).  Secrets live
+# alongside as usual (wifi_ssid, wifi_password, ha_api_key,
+# ota_password, fallback_password).
+#
+# v1 is read-only: the bridge polls the STC every 2 s and publishes
+# az / el / wind / mode to HA.  Phase 4 will add multi-tracker mesh
+# (ESP-NOW broadcast) so a primary can drive secondaries into storm.
+
+substitutions:
+  device_name: solar-tracker-1
+  friendly_name: "Solar Tracker 1"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+
+esp8266:
+  board: esp01_1m
+
+logger:
+  # HW UART is dedicated to the STC bridge -- disable serial logging.
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret ha_api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  manual_ip:
+    static_ip: 192.168.1.193
+    gateway: 192.168.1.254
+    subnet: 255.255.255.0
+    dns1: 192.168.50.1
+  ap:
+    ssid: "${device_name} Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+web_server:
+  port: 80
+  include_internal: true
+
+external_components:
+  # Raw TCP<->UART for debugging the wire when needed.
+  - source: github://oxan/esphome-stream-server
+    refresh: 0s
+  # Local Phase 3 bridge component (under ./components/tracker_bridge/).
+  - source:
+      type: local
+      path: components
+    components: [tracker_bridge]
+
+uart:
+  id: uart_bus
+  rx_buffer_size: 512
+  baud_rate: 9600
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  debug:
+    direction: BOTH
+    after:
+      timeout: 100ms
+    sequence:
+      - lambda: UARTDebug::log_hex(direction, bytes, ' ');
+
+# --- Phase 3 bridge ---------------------------------------------------
+tracker_bridge:
+  id: bridge
+  uart_id: uart_bus
+
+stream_server:
+  uart_id: uart_bus
+  port: 23
+
+# --- Sensors / status -------------------------------------------------
+sensor:
+  - platform: wifi_signal
+    name: "$friendly_name WiFi Signal"
+    update_interval: 60s
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    az:
+      name: "$friendly_name Azimuth %"
+    el:
+      name: "$friendly_name Elevation %"
+    wind:
+      name: "$friendly_name Wind"
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "$friendly_name IP Address"
+  - platform: version
+    name: "$friendly_name ESPHome Version"
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    mode:
+      name: "$friendly_name Mode"
+
+binary_sensor:
+  - platform: stream_server
+    connected:
+      name: "$friendly_name Stream Server Client Connected"
+
+# --- Debug: runtime baud-rate select (leave at 9600 unless debugging) --
+select:
+  - id: change_baud_rate
+    name: "Baud rate"
+    platform: template
+    options:
+      - "1200"
+      - "2400"
+      - "4800"
+      - "9600"
+      - "38400"
+      - "57600"
+      - "115200"
+      - "256000"
+      - "512000"
+      - "921600"
+    initial_option: "9600"
+    optimistic: true
+    restore_value: True
+    internal: false
+    entity_category: config
+    icon: mdi:swap-horizontal
+    set_action:
+      - lambda: |-
+          id(uart_bus).flush();
+          uint32_t new_baud_rate = stoi(x);
+          ESP_LOGD("change_baud_rate", "Baud %u -> %u", id(uart_bus).get_baud_rate(), new_baud_rate);
+          if (id(uart_bus).get_baud_rate() != new_baud_rate) {
+            id(uart_bus).set_baud_rate(new_baud_rate);
+            id(uart_bus).load_settings();
+          }

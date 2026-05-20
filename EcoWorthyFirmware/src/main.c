@@ -66,6 +66,19 @@ static void lcd_init(void) {
     delay_ms(2);
     lcd_cmd(0x06);
     lcd_cmd(0x0C);
+
+    /* Define custom glyph 0 = padlock (duty-lockout indicator).
+     * CGRAM addr = 0x40 | (slot<<3); 8 rows, low 5 bits each. */
+    lcd_cmd(0x40);
+    lcd_putc(0x0E);  /*  .###.  shackle */
+    lcd_putc(0x11);  /*  #...#         */
+    lcd_putc(0x11);  /*  #...#         */
+    lcd_putc(0x1F);  /*  #####  body   */
+    lcd_putc(0x1B);  /*  ##.##  keyhole*/
+    lcd_putc(0x1B);  /*  ##.##         */
+    lcd_putc(0x1F);  /*  #####         */
+    lcd_putc(0x00);  /*  .....         */
+    lcd_cmd(0x80);   /* return addr ptr to DDRAM home */
 }
 
 static void lcd_goto(unsigned char row, unsigned char col) {
@@ -113,6 +126,291 @@ static unsigned long millis(void) {
     EA = 1;
     return m;
 }
+
+/* ---- Software UART TX (Phase 3-1) ----
+ * Half-duplex bridge on P3.2 (BRIDGE_IO), open-drain, 9600 8N1.
+ * Timer 1 free-runs at the bit rate (104.166 us); its ISR shifts the
+ * TX state machine.  RX (INT0-driven) lands in P3-2 and will share
+ * this Timer 1.  9600 baud at 22.1184 MHz 1T = exactly 2304 ticks/bit
+ * (the crystal was chosen for integer baud divisors).
+ *
+ * Open-drain semantics on the shared bus: writing 1 = release (the
+ * breakout pull-up makes the line HIGH = UART idle / mark / data '1');
+ * writing 0 = actively pull LOW (start bit / data '0').
+ */
+#define T1_TICKS_PER_BIT  2304U
+#define T1_RELOAD         ((unsigned int)(65536U - T1_TICKS_PER_BIT))
+#define T1_RELOAD_LO      ((unsigned char)(T1_RELOAD & 0xFF))
+#define T1_RELOAD_HI      ((unsigned char)(T1_RELOAD >> 8))
+
+/* 1.5 bit-times: used once, from the INT0 start-bit edge, so the first
+ * Timer 1 fire lands in the MIDDLE of data bit 0.  Subsequent fires
+ * use the normal 1-bit reload -> every sample stays mid-bit. */
+#define T1_TICKS_1P5      3456U
+#define T1_RELOAD_1P5     ((unsigned int)(65536U - T1_TICKS_1P5))
+#define T1_RELOAD_1P5_LO  ((unsigned char)(T1_RELOAD_1P5 & 0xFF))
+#define T1_RELOAD_1P5_HI  ((unsigned char)(T1_RELOAD_1P5 >> 8))
+
+#define UART_TX_SZ   64           /* ring buffer; power of two */
+#define UART_TX_MASK (UART_TX_SZ - 1)
+#define UART_RX_SZ   64
+#define UART_RX_MASK (UART_RX_SZ - 1)
+
+/* Rings in __xdata: 128 bytes of buffer won't fit the 128-byte IRAM.
+ * ISR xdata access costs a few MOVX cycles -- fine at 104 us/bit. */
+static volatile __xdata unsigned char uart_tx_ring[UART_TX_SZ];
+static volatile unsigned char uart_tx_head = 0;   /* writer (main) */
+static volatile unsigned char uart_tx_tail = 0;   /* reader (ISR)  */
+/* TX bit state: 0 = idle, 1..8 = data bit 0..7, 9 = stop bit. */
+static volatile unsigned char uart_tx_state = 0;
+static volatile unsigned char uart_tx_shift = 0;
+/* Set while a TX burst owns the bus -> INT0 (RX listen) is disabled
+ * for its whole duration, re-armed once the ring drains. */
+static volatile unsigned char uart_tx_engaged = 0;
+
+static volatile __xdata unsigned char uart_rx_ring[UART_RX_SZ];
+static volatile unsigned char uart_rx_head = 0;   /* writer (ISR)  */
+static volatile unsigned char uart_rx_tail = 0;   /* reader (main) */
+/* RX bit state: rx_active gated by INT0; rx_bit 0..7 = data, 8 = stop. */
+static volatile unsigned char uart_rx_active = 0;
+static volatile unsigned char uart_rx_bit   = 0;
+static volatile unsigned char uart_rx_shift = 0;
+
+/* INT0 (pin 17 falling edge) = incoming start bit.  Only reached when
+ * EX0 is enabled, which is only true when the bus is idle (not TX, not
+ * mid-RX).  Phase-aligns Timer 1 to sample mid-bit. */
+void int0_isr(void) __interrupt(0) {
+    if (uart_tx_state == 0 && !uart_rx_active) {
+        EX0 = 0;                       /* mute edge triggers for this frame */
+        uart_rx_shift = 0;
+        uart_rx_bit   = 0;
+        uart_rx_active = 1;
+        TL1 = T1_RELOAD_1P5_LO;        /* next fire = middle of bit 0 */
+        TH1 = T1_RELOAD_1P5_HI;
+        TF1 = 0;                       /* drop any pending overflow */
+    }
+}
+
+void timer1_isr(void) __interrupt(3) {
+    /* Reload first to minimize bit-period jitter (mode 1 = manual).
+     * Always the 1-bit reload here; the special 1.5-bit reload is set
+     * once by int0_isr and consumed as the interval that just elapsed. */
+    TL1 = T1_RELOAD_LO;
+    TH1 = T1_RELOAD_HI;
+
+    if (uart_rx_active) {
+        if (uart_rx_bit < 8) {
+            if (BRIDGE_IO) uart_rx_shift |= (1 << uart_rx_bit);
+            uart_rx_bit++;
+        } else {
+            /* stop-bit slot: commit the byte, re-arm start detection. */
+            unsigned char next = (uart_rx_head + 1) & UART_RX_MASK;
+            if (next != uart_rx_tail) {        /* drop on overflow */
+                uart_rx_ring[uart_rx_head] = uart_rx_shift;
+                uart_rx_head = next;
+            }
+            uart_rx_active = 0;
+            IE0 = 0;                           /* clear latched edge */
+            EX0 = 1;                           /* listen for next start */
+        }
+        return;
+    }
+
+    if (uart_tx_state == 0) {
+        if (uart_tx_tail != uart_tx_head) {
+            /* Begin a byte.  Mute RX for the whole TX burst. */
+            if (!uart_tx_engaged) { EX0 = 0; uart_tx_engaged = 1; }
+            uart_tx_shift = uart_tx_ring[uart_tx_tail];
+            uart_tx_tail = (uart_tx_tail + 1) & UART_TX_MASK;
+            BRIDGE_IO = 0;            /* start bit (drive LOW) */
+            uart_tx_state = 1;
+        } else if (uart_tx_engaged) {
+            /* Burst fully drained -> hand the bus back to RX listen. */
+            uart_tx_engaged = 0;
+            IE0 = 0;
+            EX0 = 1;
+        }
+        /* else truly idle: leave EX0 alone (avoid racing a latched edge). */
+    } else if (uart_tx_state <= 8) {
+        BRIDGE_IO = (uart_tx_shift & 1);   /* data bit, LSB first */
+        uart_tx_shift >>= 1;
+        uart_tx_state++;
+    } else {
+        /* state == 9: stop bit (release HIGH for one bit time). */
+        BRIDGE_IO = 1;
+        uart_tx_state = 0;
+    }
+}
+
+static unsigned char uart_rx_avail(void) {
+    return uart_rx_head != uart_rx_tail;
+}
+
+static unsigned char uart_rx_get(void) {
+    unsigned char b = uart_rx_ring[uart_rx_tail];
+    uart_rx_tail = (uart_rx_tail + 1) & UART_RX_MASK;
+    return b;
+}
+
+/* ---- Framing + CRC8 (Phase 3-3) ----
+ * Wire frame:  \xAA \x55  <payload ASCII>  <crcHi> <crcLo>  \n
+ *   - payload: printable ASCII only, no '\n'
+ *   - crcHi/crcLo: the CRC8 of the payload, as 2 uppercase hex chars
+ *   - CRC8: poly 0x07, init 0x00, MSB-first, no reflection, no final
+ *     XOR (CRC-8/SMBUS).  Computed over the payload bytes ONLY.
+ * The ESPHome side MUST use this exact algorithm and CRC coverage.
+ */
+static unsigned char crc8_update(unsigned char crc, unsigned char b) {
+    unsigned char i;
+    crc ^= b;
+    for (i = 0; i < 8; i++)
+        crc = (crc & 0x80) ? (unsigned char)((crc << 1) ^ 0x07)
+                           : (unsigned char)(crc << 1);
+    return crc;
+}
+
+static char hex_digit(unsigned char nib) {
+    nib &= 0x0F;
+    return (nib < 10) ? (char)('0' + nib) : (char)('A' + (nib - 10));
+}
+
+/* TX primitives are defined later (with timer1_init); forward-declare
+ * so the framing layer can use them here. */
+static void uart_tx_byte(unsigned char b);
+
+/* Emit one complete framed packet.  CRC accumulated during TX so we
+ * never need strlen or a second pass over the payload. */
+static void uart_send_frame(const char *payload) {
+    const char *p = payload;
+    unsigned char crc = 0x00;
+    unsigned char ch;
+
+    uart_tx_byte(0xAA);
+    uart_tx_byte(0x55);
+    while (*p) {
+        ch = (unsigned char)*p++;
+        uart_tx_byte(ch);
+        crc = crc8_update(crc, ch);
+    }
+    uart_tx_byte((unsigned char)hex_digit(crc >> 4));
+    uart_tx_byte((unsigned char)hex_digit(crc & 0x0F));
+    uart_tx_byte('\n');
+}
+
+/* RX frame parser: a byte-fed state machine.  Discards everything
+ * until a \xAA\x55 prefix (kills self-echo, ESP boot spam, partials),
+ * accumulates printable payload to '\n', then verifies the trailing
+ * 2 hex chars against CRC8 of the payload.  On success, exposes the
+ * CRC-stripped, NUL-terminated payload + sets uart_frame_ready. */
+#define UART_FRAME_MAX 56
+
+static __xdata char uart_frame_buf[UART_FRAME_MAX + 1];
+static unsigned char uart_frame_len = 0;
+static unsigned char uart_frame_state = 0;  /* 0=AA,1=55,2=payload */
+static volatile unsigned char uart_frame_ready = 0;
+
+static unsigned char hex_val(char c) {
+    if (c >= '0' && c <= '9') return (unsigned char)(c - '0');
+    if (c >= 'A' && c <= 'F') return (unsigned char)(c - 'A' + 10);
+    if (c >= 'a' && c <= 'f') return (unsigned char)(c - 'a' + 10);
+    return 0xFF;
+}
+
+static void uart_frame_feed(unsigned char b) {
+    switch (uart_frame_state) {
+    case 0:
+        if (b == 0xAA) uart_frame_state = 1;
+        break;
+    case 1:
+        uart_frame_state = (b == 0x55) ? 2 : (b == 0xAA ? 1 : 0);
+        uart_frame_len = 0;
+        break;
+    default:  /* 2: accumulating payload (incl. trailing 2 CRC chars) */
+        if (b == '\n') {
+            /* Need >= 2 chars (the CRC) plus a non-empty payload. */
+            if (uart_frame_len >= 3) {
+                unsigned char hi = hex_val(uart_frame_buf[uart_frame_len - 2]);
+                unsigned char lo = hex_val(uart_frame_buf[uart_frame_len - 1]);
+                if (hi != 0xFF && lo != 0xFF) {
+                    unsigned char want = (unsigned char)((hi << 4) | lo);
+                    unsigned char crc = 0x00;
+                    unsigned char i;
+                    for (i = 0; i < uart_frame_len - 2; i++)
+                        crc = crc8_update(crc, (unsigned char)uart_frame_buf[i]);
+                    if (crc == want && !uart_frame_ready) {
+                        uart_frame_buf[uart_frame_len - 2] = '\0'; /* strip CRC */
+                        uart_frame_ready = 1;
+                    }
+                }
+            }
+            uart_frame_state = 0;
+        } else if (b == 0xAA) {
+            /* Resync: a new prefix mid-payload abandons this frame. */
+            uart_frame_state = 1;
+        } else if (b >= 0x20 && b <= 0x7E &&
+                   uart_frame_len < UART_FRAME_MAX) {
+            uart_frame_buf[uart_frame_len++] = (char)b;
+        } else {
+            /* Non-printable / overflow -> drop frame, rescan. */
+            uart_frame_state = 0;
+        }
+        break;
+    }
+}
+
+/* Drain the RX ring through the frame parser.  Call from the main
+ * loop; latency-tolerant (the ESP polls every ~2 s). */
+static void uart_poll_frames(void) {
+    while (uart_rx_avail())
+        uart_frame_feed(uart_rx_get());
+}
+
+static void timer1_init(void) {
+    AUXR |= (1 << 6);                /* T1 in 1T mode */
+    TMOD = (TMOD & 0x0F) | 0x10;     /* T1 mode 1 (16-bit), preserve T0 */
+    TL1 = T1_RELOAD_LO;
+    TH1 = T1_RELOAD_HI;
+    ET1 = 1;                         /* enable Timer 1 interrupt */
+    TR1 = 1;                         /* run Timer 1 (EA already set) */
+}
+
+/* Enqueue one byte.  Busy-waits if the ring is full (the ISR is
+ * always draining, so this can't deadlock once timer1_init ran). */
+static void uart_tx_byte(unsigned char b) {
+    unsigned char next = (uart_tx_head + 1) & UART_TX_MASK;
+    while (next == uart_tx_tail) { }   /* ring full -- wait for ISR */
+    uart_tx_ring[uart_tx_head] = b;
+    uart_tx_head = next;
+}
+
+static void uart_tx_str(const char *s) {
+    while (*s) uart_tx_byte((unsigned char)*s++);
+}
+
+/* Master HA-bridge enable.  Set to 0 to fully disable the soft-UART
+ * (no Timer 1, no INT0, no uart_service) -- A/B test for whether the
+ * bridge is what's disrupting buttons/jog. */
+#define P3_UART_ENABLE  1   /* HA bridge active */
+
+/* Button diagnostic: replaces the entire main loop with a minimal
+ * read-button -> show-on-LCD loop (no position/duty/storm/UART).
+ * Isolates whether the raw button ADC is reliable at all.  Set 0 for
+ * normal firmware. */
+#define P3_BTN_DEBUG  0
+
+/* P3-1 validation: periodic TX self-test.  Done -- left at 0. */
+#define P3_UART_TX_TEST  0
+
+/* P3-2 validation: byte echo.  Done -- left at 0. */
+#define P3_UART_RX_ECHO  0
+
+/* P3-3 validation: fixed framed packet.  Done -- left at 0. */
+#define P3_UART_FRAME_TEST  0
+
+/* P3-4 validation: periodic broadcast.  Done -- ESP polls trigger
+ * replies in P3-5.  Left at 0; flip to 1 if debugging the wire without
+ * a working ESP poller. */
+#define P3_UART_STATUS_TEST  0
 
 /* ---- IAP / EEPROM ---- */
 #define IAP_ENABLE_22MHZ  0x83
@@ -185,6 +483,13 @@ static unsigned char config_is_valid(void) {
     return (iap_read_byte(EEPROM_BASE + 0) == CONFIG_MAGIC_0 &&
             iap_read_byte(EEPROM_BASE + 1) == CONFIG_MAGIC_1);
 }
+
+/* Cached validity.  config_is_valid() does 2 IAP/flash reads with
+ * interrupts disabled -- calling it every main-loop iteration (as
+ * storm_check did) is wasteful and adds EA=0 windows.  The EEPROM
+ * only changes on config_save(), so cache it and refresh there. */
+static unsigned char cfg_valid = 0;
+static void config_valid_refresh(void) { cfg_valid = config_is_valid(); }
 
 /* Config struct layout in EEPROM (little-endian 16-bit):
  *   0..1  : magic (0xC0 0xDE)
@@ -268,6 +573,7 @@ static void config_save(void) {
     iap_program_byte(EEPROM_BASE + 9, wind_release_mps);
     iap_program_byte(EEPROM_BASE + 10, storm_dwell_min);
     iap_program_byte(EEPROM_BASE + 11, track_thresh);
+    config_valid_refresh();   /* config now persisted -> cache fresh */
 }
 
 /* ---- STC15 ADC ---- */
@@ -305,6 +611,19 @@ static unsigned int adc_read_avg(unsigned char channel, unsigned char samples) {
         sum += adc_read(channel);
     }
     return (unsigned int)(sum / samples);
+}
+
+/* Settled read for high-impedance sources (the button resistor ladder
+ * is up to ~120 kOhm).  The first conversion after a channel mux switch
+ * is contaminated by S/H-cap charge left from the previous channel; we
+ * discard it (its conversion time lets the cap settle through the new
+ * source) and return the second.  Averaging the settled samples further
+ * rejects noise so the debounce can latch on a short press. */
+static unsigned int adc_read_settled(unsigned char channel,
+                                     unsigned char samples) {
+    adc_read(channel);                 /* discard 1: absorbs mux switch */
+    adc_read(channel);                 /* discard 2: high-Z ladder settle */
+    return adc_read_avg(channel, samples);
 }
 
 static unsigned char wind_mps(unsigned int adc) {
@@ -416,6 +735,12 @@ static __xdata unsigned long ns_duty_lockout_end = 0;
 static __xdata unsigned long ew_duty_lockout_end = 0;
 static __xdata unsigned long duty_last_tick_ms = 0;
 
+/* Wind cache: storm_check() samples wind at 1 Hz; the cached m/s value
+ * is what UI screens (jog, idle) display.  This is the architectural
+ * decoupling that fixed jog -- screens never read ADC themselves, so
+ * the button channel never gets contaminated by per-loop mux switches. */
+static __xdata unsigned char wind_mps_cached = 0;
+
 /* ---- Storm interlock (Phase 2C-9) ----
  * High wind forces ST_STORM: drive to the saved horizontal position
  * (PARKING), then hold there (HOLDING) until wind has stayed below
@@ -443,6 +768,22 @@ static void duty_tick(void) {
      * important than motor thermal limits.  Timestamp still advanced
      * above so post-park dt isn't a huge jump. */
     if (storm_parking) return;
+
+    /* Self-heal: a lockout_end more than DUTY_OFF_LOCKOUT_MS in the
+     * future is impossible to set legitimately (it's always now+limit).
+     * Such a value can only come from corruption / a bad init and would
+     * otherwise never satisfy `now >= lockout_end` -> permanent lock.
+     * Force-clear it so the interlock can never brick the actuators. */
+    if (ns_duty_lockout_end != 0 &&
+        ns_duty_lockout_end - now > DUTY_OFF_LOCKOUT_MS) {
+        ns_duty_lockout_end = 0;
+        ns_duty_on_ms = 0;
+    }
+    if (ew_duty_lockout_end != 0 &&
+        ew_duty_lockout_end - now > DUTY_OFF_LOCKOUT_MS) {
+        ew_duty_lockout_end = 0;
+        ew_duty_on_ms = 0;
+    }
 
     if (ns_duty_lockout_end != 0) {
         if (now >= ns_duty_lockout_end) {
@@ -473,8 +814,10 @@ static void duty_tick(void) {
 
 /* Reset position to 0 and prime backlash.  Call after any operation
  * that lands the actuator at the retract endstop (boot zero, cal).
- * Also re-arms the duty tick clock so the blocking-call time gap isn't
- * miscredited (accumulators are preserved -- cal motor heat is real). */
+ * Re-arms BOTH tick clocks so the blocking-call time gap isn't
+ * miscredited.  Does NOT touch duty thermal state -- that's a
+ * separate policy decision (cold vs. hot), see duty_cold_reset()
+ * and duty_force_cooldown() below. */
 static void position_reset(void) {
     ns_pos_ms = 0;
     ew_pos_ms = 0;
@@ -484,6 +827,33 @@ static void position_reset(void) {
     ew_pos_prev = AXIS_OFF;
     pos_last_tick_ms = millis();
     duty_last_tick_ms = millis();
+}
+
+/* COLD policy: motor assumed cool (long power-off before boot).  Zero
+ * the interlock.  Imperative, not relying on static __xdata init --
+ * a stuck-true duty lockout at boot bricks the actuators and is
+ * unrecoverable, so it must be cleared in code, unconditionally. */
+static void duty_cold_reset(void) {
+    ns_duty_on_ms = 0;
+    ew_duty_on_ms = 0;
+    ns_duty_lockout_end = 0;
+    ew_duty_lockout_end = 0;
+    duty_last_tick_ms = millis();
+}
+
+/* HOT policy: calibration just ran each axis ~3x stroke (~3 min for a
+ * 65 s stroke) -- well past the 2 min rating -- but the blocking cal
+ * couldn't be observed by duty_tick().  Impute that thermal cost:
+ * force both axes into the full cooldown lockout so the motors rest
+ * (padlock shows).  A user who must move sooner can power-cycle (a
+ * deliberate cold reset -- they're at the controller anyway). */
+static void duty_force_cooldown(void) {
+    unsigned long now = millis();
+    ns_duty_on_ms = 0;
+    ew_duty_on_ms = 0;
+    ns_duty_lockout_end = now + DUTY_OFF_LOCKOUT_MS;
+    ew_duty_lockout_end = now + DUTY_OFF_LOCKOUT_MS;
+    duty_last_tick_ms = now;
 }
 
 /* Integrate one axis's contribution this tick.  Encapsulates the
@@ -663,7 +1033,7 @@ static void cal_show(const char *label, unsigned long elapsed) {
 
 /* Edge-detect QUIT for use inside the blocking calibrate(). */
 static unsigned char cal_quit_pressed(button_t *prev) {
-    unsigned int adc = adc_read(ADC_CH_BUTTONS);
+    unsigned int adc = adc_read_settled(ADC_CH_BUTTONS, 4);
     button_t curr = button_classify(adc);
     unsigned char quit = (curr == BTN_QUIT && *prev == BTN_NONE);
     *prev = curr;
@@ -1116,11 +1486,31 @@ static void track_tick(button_t pressed, state_t *state) {
  * On a storm-strength gust, force ST_STORM (PARKING) and reset duty
  * (safety > thermal).  No-op if already storming or uncalibrated
  * (can't compute a horizontal target without stroke times). */
+/* Wind only changes over hundreds of ms; sampling it every ~50 ms
+ * loop was pointless AND poisoned the very next button ADC read via
+ * the WIND->BUTTON mux switch.  Sample at ~1 Hz: still catches a
+ * building gust well before it can damage the array, and 98% of loop
+ * iterations no longer switch the ADC away from the button channel. */
+#define STORM_SCAN_MS  1000UL
+
 static void storm_check(state_t *state) {
     static __xdata unsigned char w;
-    if (*state == ST_STORM) return;
-    if (!config_is_valid()) return;
+    static __xdata unsigned long storm_scan_last = 0;
+    unsigned long now;
+
+    now = millis();
+    if (now - storm_scan_last < STORM_SCAN_MS) return;
+    storm_scan_last = now;
+
+    /* Always sample + cache wind (UI uses the cache).  Storm action is
+     * gated below; the cache update is unconditional so jog/idle still
+     * see live wind even when uncalibrated or already storming. */
     w = wind_mps(adc_read_avg(ADC_CH_WIND, 8));
+    wind_mps_cached = w;
+
+    if (*state == ST_STORM) return;
+    if (!cfg_valid) return;
+
     if (w >= wind_storm_mps) {
         ns_duty_on_ms = 0; ew_duty_on_ms = 0;
         ns_duty_lockout_end = 0; ew_duty_lockout_end = 0;
@@ -1208,6 +1598,71 @@ static void storm_tick(state_t *state) {
         lcd_putc('0' + ((unsigned char)remain / 10));
         lcd_putc('0' + ((unsigned char)remain % 10));
         lcd_print("m ");
+    }
+}
+
+/* ---- HA status responder (Phase 3-4, read-only) ----
+ * On a valid framed `?` poll, reply with one framed status packet:
+ *   az=<ew%> el=<ns%> wind=<mps> mode=<m>
+ * az = E/W axis position % (rotation), el = N/S axis position % (tilt).
+ * Fully ISR-decoupled: the parser runs in the main loop, the reply is
+ * enqueued to the TX ring; nothing blocks the 50 ms state machine.
+ * During blocking cal/boot the loop doesn't run, so HA simply sees the
+ * sensor go stale (ESPHome marks unavailable) until cal finishes. */
+static const char *uart_mode_str(state_t st) {
+    switch (st) {
+        case ST_NO_CAL:        return "nocal";
+        case ST_IDLE:          return "idle";
+        case ST_MENU:          return "menu";
+        case ST_TRACK:         return "track";
+        case ST_STORM:         return "storm";
+        case ST_CAL:           return "cal";
+        case ST_BTEST:         return "btest";
+        case ST_SETTINGS:      return "set";
+        case ST_SETTINGS_EDIT: return "set";
+        case ST_JOG:           return "jog";
+        case ST_VERSION:       return "ver";
+        default:               return "?";
+    }
+}
+
+static char *uart_app_str(char *p, const char *s) {
+    while (*s) *p++ = *s++;
+    return p;
+}
+
+static char *uart_app_u8(char *p, unsigned char v) {
+    if (v >= 100) { *p++ = '0' + v / 100; v %= 100;
+                    *p++ = '0' + v / 10;  *p++ = '0' + v % 10; }
+    else if (v >= 10) { *p++ = '0' + v / 10; *p++ = '0' + v % 10; }
+    else { *p++ = '0' + v; }
+    return p;
+}
+
+static void uart_status_send(state_t st) {
+    static __xdata char buf[40];
+    char *p = buf;
+    p = uart_app_str(p, "az=");
+    p = uart_app_u8(p, pos_to_pct(ew_pos_ms, ew_stroke_ms));
+    p = uart_app_str(p, " el=");
+    p = uart_app_u8(p, pos_to_pct(ns_pos_ms, ns_stroke_ms));
+    p = uart_app_str(p, " wind=");
+    p = uart_app_u8(p, wind_mps(adc_read_avg(ADC_CH_WIND, 8)));
+    p = uart_app_str(p, " mode=");
+    p = uart_app_str(p, uart_mode_str(st));
+    *p = '\0';
+    uart_send_frame(buf);
+}
+
+/* Drain RX through the frame parser; on a valid bare-`?` poll, reply
+ * with a status frame.  v1 read-only: any non-`?` payload is ignored
+ * (no command surface).  Call once per main-loop iteration. */
+static void uart_service(state_t st) {
+    uart_poll_frames();
+    if (uart_frame_ready) {
+        if (uart_frame_buf[0] == '?' && uart_frame_buf[1] == '\0')
+            uart_status_send(st);
+        uart_frame_ready = 0;
     }
 }
 
@@ -1299,8 +1754,7 @@ static void settings_edit_tick(button_t pressed, state_t *state) {
 static void jog_tick(button_t pressed, button_t curr_button,
                      unsigned char idle_timeout, state_t *state) {
     static __xdata axis_state_t tgt_ns, tgt_ew;
-    static __xdata unsigned char ns_pct, ew_pct, mps;
-    static __xdata unsigned int wind;
+    static __xdata unsigned char ns_pct, ew_pct;
 
     tgt_ns = AXIS_OFF;
     tgt_ew = AXIS_OFF;
@@ -1340,11 +1794,13 @@ static void jog_tick(button_t pressed, button_t curr_button,
         pos_last_tick_ms = millis();
     }
 
-    /* Layout A: position % on row 0, arrows + wind on row 1. */
+    /* Layout A: position % on row 0, axis arrows on row 1.
+     * NOTE: no ADC reads here on purpose -- a per-loop WIND read would
+     * mux-switch the ADC right before the next button sample, jittering
+     * the high-Z button ladder and flickering curr_button (jog needs it
+     * latched every iteration, unlike edge-driven menus). */
     ns_pct = pos_to_pct(ns_pos_ms, ns_stroke_ms);
     ew_pct = pos_to_pct(ew_pos_ms, ew_stroke_ms);
-    wind   = adc_read(ADC_CH_WIND);
-    mps    = wind_mps(wind);
 
     lcd_goto(0, 0);
     lcd_print("NS=");
@@ -1357,14 +1813,19 @@ static void jog_tick(button_t pressed, button_t curr_button,
     lcd_putc('0' + (ew_pct % 10));
     lcd_print("  ");
 
+    /* Row 1: "NS=N EW=E W=NN  " -- 15 chars; col 15 reserved for the
+     * padlock overlay drawn in the main loop after this render.  Wind
+     * comes from the 1 Hz cache (no ADC read here -- a per-loop ADC
+     * channel switch would jitter the next button read and kill jog). */
     lcd_goto(1, 0);
     lcd_print("NS=");
     lcd_putc(ns_char(ns_state));
     lcd_print(" EW=");
     lcd_putc(ew_char(ew_state));
-    lcd_print(" Wnd=");
-    lcd_putc('0' + (mps / 10));
-    lcd_putc('0' + (mps % 10));
+    lcd_print(" W=");
+    lcd_putc('0' + (wind_mps_cached / 10));
+    lcd_putc('0' + (wind_mps_cached % 10));
+    lcd_putc(' ');
 
     if (pressed == BTN_QUIT) {
         set_axis_ns(AXIS_OFF);
@@ -1454,6 +1915,12 @@ void main(void) {
     P1M0 &= ~ANALOG_PINS;
     P1ASF = ANALOG_PINS;
 
+    /* P3.2 (pin 17, BRIDGE_IO) open-drain for the half-duplex bus.
+     * Bit-level ops only -- P3 is split-purpose (relays/LCD share it). */
+    P3M0 |= (1 << 2);
+    P3M1 |= (1 << 2);
+    BRIDGE_IO = 1;        /* release line (idle HIGH via breakout pull-up) */
+
     /* Backlight on for the duration of normal operation.  Future work:
      * dim or auto-off after inactivity to save power. */
     LCD_BL = 1;
@@ -1461,6 +1928,11 @@ void main(void) {
     lcd_init();
     adc_init();
     timer0_init();        /* start 1 kHz ms counter for millis() */
+#if P3_UART_ENABLE
+    timer1_init();        /* start soft-UART bit clock (9600 8N1) */
+    IT0 = 1;              /* INT0 = falling-edge (UART start bit) */
+    EX0 = 1;              /* arm RX start-bit detection */
+#endif
     config_load();        /* pull stroke times + horizontal from EEPROM if cal'd */
 
     /* Capture stall-current baseline with all relays guaranteed OFF.
@@ -1468,7 +1940,8 @@ void main(void) {
     delay_ms(200);
     current_idle = adc_read_avg(ADC_CH_STALL, 16);
 
-    state = config_is_valid() ? ST_IDLE : ST_NO_CAL;
+    config_valid_refresh();   /* prime the cached validity flag */
+    state = cfg_valid ? ST_IDLE : ST_NO_CAL;
 
     /* If calibrated, run auto-zero before entering normal operation.
      * Failure (timeout or user QUIT) falls through to IDLE -- the user
@@ -1485,7 +1958,8 @@ void main(void) {
             delay_ms(2000);
         }
     }
-    position_reset();   /* zero pos vars + arm pos_last_tick_ms */
+    position_reset();    /* zero pos vars + arm tick clocks */
+    duty_cold_reset();   /* boot: motor cold -> interlock clear */
     lcd_clear();
 
     for (;;) {
@@ -1493,6 +1967,38 @@ void main(void) {
         button_t raw_button;
         button_t curr_button;
         button_t pressed;
+
+#if P3_BTN_DEBUG
+        {
+            static __xdata unsigned int dbg_n = 0;
+            unsigned int a  = adc_read_settled(ADC_CH_BUTTONS, 4);
+            unsigned int a1 = adc_read(ADC_CH_BUTTONS);  /* raw, post-settle */
+            button_t bc = button_classify(a);
+            const char *nm =
+                (bc == BTN_NONE)  ? "NONE " : (bc == BTN_SET)   ? "SET  " :
+                (bc == BTN_QUIT)  ? "QUIT " : (bc == BTN_WEST)  ? "WEST " :
+                (bc == BTN_EAST)  ? "EAST " : (bc == BTN_NORTH) ? "NORTH" :
+                                    "SOUTH";
+            dbg_n++;
+            lcd_goto(0, 0);
+            lcd_print("S=");
+            lcd_putc('0' + (a / 1000));      lcd_putc('0' + ((a / 100) % 10));
+            lcd_putc('0' + ((a / 10) % 10)); lcd_putc('0' + (a % 10));
+            lcd_print(" R=");
+            lcd_putc('0' + (a1 / 1000));      lcd_putc('0' + ((a1 / 100) % 10));
+            lcd_putc('0' + ((a1 / 10) % 10)); lcd_putc('0' + (a1 % 10));
+            lcd_print("  ");
+            lcd_goto(1, 0);
+            lcd_print(nm);
+            lcd_print(" #");
+            lcd_putc('0' + ((dbg_n / 100) % 10));
+            lcd_putc('0' + ((dbg_n / 10) % 10));
+            lcd_putc('0' + (dbg_n % 10));
+            lcd_print("      ");
+            delay_ms(80);
+            continue;
+        }
+#endif
 
         /* Integrate position based on whatever axis state was in effect
          * for the time elapsed since the last loop iteration.  Must run
@@ -1502,7 +2008,38 @@ void main(void) {
         duty_tick();   /* enforce motor on-time limit regardless of mode */
         storm_check(&state);  /* wind watchdog -- may force ST_STORM */
 
-        btn_adc = adc_read(ADC_CH_BUTTONS);
+#if P3_UART_TX_TEST
+        {
+            static __xdata unsigned long uart_test_last = 0;
+            unsigned long uart_test_now = millis();
+            if (uart_test_now - uart_test_last >= 2000UL) {
+                uart_test_last = uart_test_now;
+                uart_tx_str("ECOWORTHY TX TEST\r\n");
+            }
+        }
+#endif
+#if P3_UART_RX_ECHO
+        while (uart_rx_avail()) {
+            uart_tx_byte(uart_rx_get());
+        }
+#endif
+#if P3_UART_ENABLE
+        /* HA bridge: parse polls, reply with status.  Always runs;
+         * fully non-blocking (parser + enqueue only). */
+        uart_service(state);
+#endif
+#if P3_UART_ENABLE && P3_UART_STATUS_TEST
+        {
+            static __xdata unsigned long uart_st_last = 0;
+            unsigned long uart_st_now = millis();
+            if (uart_st_now - uart_st_last >= 2000UL) {
+                uart_st_last = uart_st_now;
+                uart_status_send(state);
+            }
+        }
+#endif
+
+        btn_adc = adc_read_settled(ADC_CH_BUTTONS, 4);
         raw_button = button_classify(btn_adc);
 
         /* Debounce: confirm a new button only after BTN_DEBOUNCE_N
@@ -1665,9 +2202,12 @@ void main(void) {
             /* Hold result on screen for a moment so the user can see it. */
             delay_ms(2000);
             /* Cal ends at the retract endstop -> re-zero the integrator
-             * and re-arm the dt clock so the gap doesn't get credited
-             * to the next FWD/REV state. */
+             * and re-arm the tick clocks.  Then impute cal's thermal
+             * cost: the motors ran ~3x stroke uninterrupted (blocking
+             * cal, duty_tick blind), so force the cooldown lockout --
+             * the padlock will show until the motors have rested. */
             position_reset();
+            duty_force_cooldown();
             lcd_clear();
             idle_ticks = 0;
             prev_button = BTN_NONE;
@@ -1756,6 +2296,13 @@ void main(void) {
             break;
         }
 
-        delay_ms(50);
+        /* Duty-lockout indicator: padlock glyph (CGRAM 0) at the
+         * bottom-right cell whenever either axis is duty-locked,
+         * blank otherwise.  Overlaid after the state render so it's
+         * visible on every screen via one code path. */
+        lcd_goto(1, 15);
+        lcd_putc((ns_duty_locked() || ew_duty_locked()) ? 0x00 : ' ');
+
+        delay_ms(2);   /* was 50 (~150ms actual) -- crushed poll rate */
     }
 }
