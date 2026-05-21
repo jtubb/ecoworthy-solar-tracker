@@ -43,7 +43,7 @@ extern "C" {
 #include <Crypto.h>
 #include <AES.h>
 #include <GCM.h>
-#include <SHA1.h>
+#include <SHA256.h>
 
 #include <string>
 #include <cstdlib>
@@ -227,7 +227,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
   std::string mesh_psk_{};
-  uint8_t mesh_key_[16]{};      /* derived from psk_ via SHA1 trunc (deterministic) */
+  uint8_t mesh_key_[16]{};      /* derived from psk_ via SHA-256 trunc (deterministic) */
   std::string tracker_id_{};
   bool mesh_enabled_{false};
   bool test_broadcast_{false};
@@ -245,11 +245,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 
   /* ---- mesh_setup_: derive key, restore counter, init ESP-NOW ---- */
   void mesh_setup_() {
-    /* Derive a 16-byte AES key from the passphrase via SHA1 truncation.
+    /* Derive a 16-byte AES key from the passphrase via SHA-256 truncation.
      * Deterministic: operators can use a human-readable string in YAML. */
-    SHA1 sha;
+    SHA256 sha;
     sha.update(mesh_psk_.data(), mesh_psk_.size());
-    uint8_t digest[20];
+    uint8_t digest[32];
     sha.finalize(digest, sizeof(digest));
     memcpy(mesh_key_, digest, 16);
 
