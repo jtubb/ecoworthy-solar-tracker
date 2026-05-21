@@ -121,9 +121,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     auto key = make_name_key_(name);
     /* Just ensure the slot exists; sensors are attached later by set_*_for(). */
     peer_decls_[key];  // default-constructs PeerDecl if not present
-    char hex[33] = {};
-    for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02X", (uint8_t) key[i]);
-    ESP_LOGI(TAG, "registered peer '%s' key[0..15]=%s", name.c_str(), hex);
+    ESP_LOGD(TAG, "registered peer '%s'", name.c_str());
   }
 
   /* --- Config slider write path: local STC or remote peer via mesh --- */
@@ -175,16 +173,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
      * regardless of upstream state. */
     this->set_interval("poll", 2000, [this]() { this->send_poll_(); });
     ESP_LOGCONFIG(TAG, "tracker_bridge configured");
-
-    /* DEBUG: dump peer_decls_ state after register_peer calls from codegen
-     * should have completed.  If size is 0 here, codegen never emitted the
-     * register_peer calls -- problem is in __init__.py. */
-    ESP_LOGI(TAG, "setup(): peer_decls_ size=%u", (unsigned) peer_decls_.size());
-    for (const auto &kv : peer_decls_) {
-      char hex[65] = {};
-      for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02X", (uint8_t) kv.first[i]);
-      ESP_LOGI(TAG, "  declared key[0..31]=%s", hex);
-    }
 
     if (mesh_enabled_) {
       mesh_setup_();
@@ -896,19 +884,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   void publish_peer_to_ha_(const std::array<char, 32> &name_key, const PeerEntry &e) {
     auto it = peer_decls_.find(name_key);
     if (it == peer_decls_.end()) {
-      ESP_LOGW(TAG, "[gateway] unknown peer node_name '%.32s' -- not in peer_decls_",
+      ESP_LOGD(TAG, "[gateway] no entity binding for peer '%.32s' (not declared in YAML)",
                name_key.data());
-      /* Diagnostic: dump full 32 bytes of inbound key + each registered key
-       * so we can see exactly where they diverge. */
-      char hex_in[65] = {};
-      for (int i = 0; i < 32; i++) sprintf(hex_in + i * 2, "%02X", (uint8_t) name_key[i]);
-      ESP_LOGW(TAG, "  inbound  key[0..31]=%s", hex_in);
-      ESP_LOGW(TAG, "  peer_decls_ size=%u", (unsigned) peer_decls_.size());
-      for (const auto &kv : peer_decls_) {
-        char hex_reg[65] = {};
-        for (int i = 0; i < 32; i++) sprintf(hex_reg + i * 2, "%02X", (uint8_t) kv.first[i]);
-        ESP_LOGW(TAG, "  declared key[0..31]=%s", hex_reg);
-      }
       return;
     }
     auto &d = it->second;
