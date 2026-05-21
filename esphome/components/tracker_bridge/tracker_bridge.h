@@ -22,15 +22,10 @@
  *
  * Phase 4: ESP-NOW mesh broadcast with AES-128-CCM authenticated
  * encryption.  mesh_tx_/mesh_rx_/mesh_dispatch_ live in this file.
- * Set MESH_TEST_BROADCAST to 1 locally to emit a 2-byte test packet
- * 3 s after boot (for bench validation with a listener node); leave
- * at 0 for production.
+ * Set `mesh: test_broadcast: true` in YAML to emit a 2-byte test
+ * packet 3 s after boot (for bench validation with a listener node);
+ * leave unset / false in production.
  */
-
-/* Gate for bench validation -- flip to 1 locally, never commit as 1. */
-#ifndef MESH_TEST_BROADCAST
-#define MESH_TEST_BROADCAST 0
-#endif
 
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
@@ -71,6 +66,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   void set_mesh_channel(uint8_t ch) { mesh_channel_ = ch; mesh_enabled_ = true; }
   void set_mesh_psk(const std::string &psk) { mesh_psk_ = psk; }
   void set_tracker_id(const std::string &id) { tracker_id_ = id; }
+  void set_test_broadcast(bool v) { test_broadcast_ = v; }
 
   void setup() override {
     /* Poll the STC every 2 s.  ESPHome's set_interval handles timing
@@ -83,17 +79,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       mesh_setup_();
     }
 
-#if MESH_TEST_BROADCAST
-    /* Bench validation: broadcast a 2-byte test packet 3 s after boot.
-     * Flip MESH_TEST_BROADCAST to 1 locally; keep 0 in production. */
-    this->set_timeout(3000, [this]() {
-      if (mesh_enabled_) {
+    if (mesh_enabled_ && test_broadcast_) {
+      /* Bench validation: broadcast a 2-byte test packet 3 s after boot. */
+      this->set_timeout(3000, [this]() {
         uint8_t test[] = {0xDE, 0xAD};
         mesh_tx_(99, test, 2);  /* type 99 = test, not an assigned type */
-        ESP_LOGI(TAG, "test broadcast sent (MESH_TEST_BROADCAST=1)");
-      }
-    });
-#endif
+        ESP_LOGI(TAG, "test broadcast sent");
+      });
+    }
   }
 
   void loop() override {
@@ -237,6 +230,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   uint8_t mesh_key_[16]{};      /* derived from psk_ via SHA1 trunc (deterministic) */
   std::string tracker_id_{};
   bool mesh_enabled_{false};
+  bool test_broadcast_{false};
 
   /* --- TX counter + flash persistence --- */
   uint32_t tx_counter_{0};
