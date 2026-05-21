@@ -51,6 +51,7 @@ extern "C" {
 
 #include <string>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <array>
 
@@ -283,6 +284,17 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   /* --- Per-peer last-accepted counter (replay protection) --- */
   std::map<std::array<uint8_t, 6>, uint32_t> peer_last_ctr_;
 
+  /* --- Per-peer application state (gateway election + HA publishing) --- */
+  struct PeerEntry {
+    uint32_t last_gateway_hb_ms{0};   // when we last saw GATEWAY_HB
+    uint32_t last_telemetry_ms{0};
+    uint8_t az_pct{0}, el_pct{0}, wind_used{0};
+    std::string mode{};
+  };
+  std::map<std::array<uint8_t, 6>, PeerEntry> peers_;
+
+  static constexpr uint32_t HB_STALE_MS = 15000;   // 3 missed @ 5s
+
   /* Singleton pointer -- ESP-NOW C callback has no user-data parameter. */
   static TrackerBridge *instance_;
 
@@ -478,10 +490,22 @@ class TrackerBridge : public Component, public uart::UARTDevice {
          * STC's own storm_check can trip without a local wind sensor. */
         send_command_frame_("!wind=", p[0]);
         break;
-      case MSG_TELEMETRY:
-      case MSG_GATEWAY_HB:
-        /* Handled in Tasks 9 + 10. */
+      case MSG_GATEWAY_HB: {
+        std::array<uint8_t, 6> key{src[0],src[1],src[2],src[3],src[4],src[5]};
+        peers_[key].last_gateway_hb_ms = millis();
         break;
+      }
+      case MSG_TELEMETRY: {
+        if (plen < 4) return;
+        std::array<uint8_t, 6> key{src[0],src[1],src[2],src[3],src[4],src[5]};
+        auto &e = peers_[key];
+        e.last_telemetry_ms = millis();
+        e.az_pct = p[0]; e.el_pct = p[1]; e.wind_used = p[2];
+        e.mode = mode_from_code_(p[3]);
+        /* If we're the acting gateway, publish to HA for this peer */
+        if (is_acting_gateway_()) publish_peer_to_ha_(src, e);
+        break;
+      }
       default:
         /* type=99 is the bench test type; others are future. */
         break;
@@ -529,6 +553,48 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (m == "btest")  return 8;
     if (m == "ver")    return 9;
     return 255;  /* 255 = unknown mode sentinel (STC sent '?' or a new mode we don't know) */
+  }
+
+  /* Inverse of mode_to_code_: decode a packed code back to the mode string. */
+  static std::string mode_from_code_(uint8_t code) {
+    switch (code) {
+      case 0: return "idle";
+      case 1: return "track";
+      case 2: return "storm";
+      case 3: return "jog";
+      case 4: return "cal";
+      case 5: return "menu";
+      case 6: return "set";
+      case 7: return "nocal";
+      case 8: return "btest";
+      case 9: return "ver";
+      default: return "?";
+    }
+  }
+
+  /* Gateway election: returns true iff this node has the lowest MAC among
+   * all nodes currently broadcasting GATEWAY_HB within HB_STALE_MS AND
+   * this node itself has WiFi connectivity. */
+  bool is_acting_gateway_() {
+    if (!WiFi.isConnected()) return false;
+    uint8_t my_mac[6];
+    WiFi.macAddress(my_mac);
+    uint32_t now = millis();
+    /* Find lowest MAC currently broadcasting GATEWAY_HB within HB_STALE_MS */
+    std::array<uint8_t, 6> lowest{my_mac[0],my_mac[1],my_mac[2],my_mac[3],my_mac[4],my_mac[5]};
+    for (const auto &kv : peers_) {
+      if (now - kv.second.last_gateway_hb_ms > HB_STALE_MS) continue;
+      if (kv.first < lowest) lowest = kv.first;
+    }
+    return std::memcmp(my_mac, lowest.data(), 6) == 0;
+  }
+
+  /* Publish peer telemetry to HA.  Task 9: log only.
+   * Task 11 will wire src MAC → declared peer sensor entities. */
+  void publish_peer_to_ha_(uint8_t src[6], const PeerEntry &e) {
+    ESP_LOGI(TAG, "[gateway] peer %02X..%02X az=%u el=%u wind=%u mode=%s",
+             src[0], src[5], e.az_pct, e.el_pct, e.wind_used, e.mode.c_str());
+    /* Map src MAC to declared peer sensors in Task 11 */
   }
 
   /* ---- send_command_frame_: build and write a !cmd=NN framed UART packet ----
