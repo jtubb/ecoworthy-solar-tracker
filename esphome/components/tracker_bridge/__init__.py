@@ -37,6 +37,16 @@ CONF_TRACKER_ID = "tracker_id"
 CONF_TEST_BROADCAST = "test_broadcast"
 CONF_LOCAL_ROLE = "local_role"
 
+# --- Phase 4 Task 11: peer list ---
+CONF_PEERS = "peers"
+CONF_MAC = "mac"
+CONF_ID_LABEL = "id"
+
+PEER_SCHEMA = cv.Schema({
+    cv.Required(CONF_MAC): cv.mac_address,
+    cv.Required(CONF_ID_LABEL): cv.string_strict,
+})
+
 CONFIG_SCHEMA = (
     cv.Schema({
         cv.GenerateID(): cv.declare_id(TrackerBridge),
@@ -53,6 +63,10 @@ CONFIG_SCHEMA = (
             # Set per-device in YAML; defaults to "secondary" if unset.
             cv.Optional(CONF_LOCAL_ROLE, default="secondary"):
                 cv.one_of("primary", "secondary", lower=True),
+            # Declared peer trackers: each entry maps a station MAC to a
+            # short id_label used by sensor/text_sensor/number platforms to
+            # attach their entities to the right peer slot.
+            cv.Optional(CONF_PEERS, default=[]): cv.ensure_list(PEER_SCHEMA),
         }),
     })
     .extend(cv.COMPONENT_SCHEMA)
@@ -75,3 +89,12 @@ async def to_code(config):
         cg.add(var.set_tracker_id(mesh[CONF_TRACKER_ID]))
         cg.add(var.set_test_broadcast(mesh[CONF_TEST_BROADCAST]))
         cg.add(var.set_local_role(1 if mesh[CONF_LOCAL_ROLE] == "primary" else 2))
+        # Register declared peers before sensor/text_sensor/number platforms run
+        # (this to_code executes first; platforms attach afterwards).
+        for peer in mesh.get(CONF_PEERS, []):
+            mac = peer[CONF_MAC].parts   # tuple of 6 ints
+            cg.add(var.register_peer(
+                mac[0], mac[1], mac[2],
+                mac[3], mac[4], mac[5],
+                peer[CONF_ID_LABEL],
+            ))

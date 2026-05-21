@@ -88,6 +88,9 @@ tracker_bridge:
     psk: !secret tracker_mesh_psk
     tracker_id: "T1"
     local_role: secondary  # bench test: receives WIND from synthetic primary on tracker-2
+    peers:
+      - mac: "84:F3:EB:03:FB:B2"   # Tracker-2 station MAC (verified from logs)
+        id: "T2"
 
 stream_server:
   uart_id: uart_bus
@@ -98,6 +101,7 @@ sensor:
   - platform: wifi_signal
     name: "$friendly_name WiFi Signal"
     update_interval: 60s
+  # T1 (local STC) status sensors
   - platform: tracker_bridge
     tracker_bridge_id: bridge
     az:
@@ -106,6 +110,16 @@ sensor:
       name: "$friendly_name Elevation %"
     wind:
       name: "$friendly_name Wind"
+  # T2 peer status sensors (published by gateway when T2 TELEMETRY is received)
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: "T2"
+    az:
+      name: "Solar Tracker 2 Azimuth %"
+    el:
+      name: "Solar Tracker 2 Elevation %"
+    wind:
+      name: "Solar Tracker 2 Wind"
 
 text_sensor:
   - platform: wifi_info
@@ -113,10 +127,17 @@ text_sensor:
       name: "$friendly_name IP Address"
   - platform: version
     name: "$friendly_name ESPHome Version"
+  # T1 (local STC) mode
   - platform: tracker_bridge
     tracker_bridge_id: bridge
     mode:
       name: "$friendly_name Mode"
+  # T2 peer mode (published by gateway when T2 TELEMETRY is received)
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: "T2"
+    mode:
+      name: "Solar Tracker 2 Mode"
 
 binary_sensor:
   - platform: stream_server
@@ -130,6 +151,56 @@ button:
     force_park:    { name: "$friendly_name Force Park" }
     force_release: { name: "$friendly_name Force Release" }
     stop:          { name: "$friendly_name Emergency Stop" }
+
+# --- Phase 4 Task 11: RW config sliders -----------------------------------
+# T1 (local STC) config.  Moving a slider sends !cfg set id=N val=V over UART.
+number:
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    wind_storm_mps:
+      name: "$friendly_name Wind Storm"
+      min_value: 5
+      max_value: 30
+      step: 1
+    wind_release_mps:
+      name: "$friendly_name Wind Release"
+      min_value: 0
+      max_value: 20
+      step: 1
+    storm_dwell_min:
+      name: "$friendly_name Storm Dwell"
+      min_value: 1
+      max_value: 60
+      step: 1
+    track_thresh:
+      name: "$friendly_name Track Threshold"
+      min_value: 1
+      max_value: 99
+      step: 1
+  # T2 peer config.  Moving a slider broadcasts CONFIG SET_REQ over mesh.
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: "T2"
+    wind_storm_mps:
+      name: "Solar Tracker 2 Wind Storm"
+      min_value: 5
+      max_value: 30
+      step: 1
+    wind_release_mps:
+      name: "Solar Tracker 2 Wind Release"
+      min_value: 0
+      max_value: 20
+      step: 1
+    storm_dwell_min:
+      name: "Solar Tracker 2 Storm Dwell"
+      min_value: 1
+      max_value: 60
+      step: 1
+    track_thresh:
+      name: "Solar Tracker 2 Track Threshold"
+      min_value: 1
+      max_value: 99
+      step: 1
 
 # --- Debug: runtime baud-rate select (leave at 9600 unless debugging) --
 select:

@@ -67,10 +67,76 @@ static const char *const TAG = "tracker_bridge";
 
 class TrackerBridge : public Component, public uart::UARTDevice {
  public:
+  /* --- Local entity setters (peer_id == "") --- */
   void set_az_sensor(sensor::Sensor *s)        { az_ = s; }
   void set_el_sensor(sensor::Sensor *s)        { el_ = s; }
   void set_wind_sensor(sensor::Sensor *s)      { wind_ = s; }
   void set_mode_sensor(text_sensor::TextSensor *s) { mode_ = s; }
+
+  /* --- Per-peer entity setters: empty peer_id → local, else route to peer_decls_ --- */
+  void set_az_sensor_for(const std::string &peer_id, sensor::Sensor *s) {
+    if (peer_id.empty()) { az_ = s; return; }
+    for (auto &kv : peer_decls_) {
+      if (kv.second.id_label == peer_id) { kv.second.az = s; return; }
+    }
+    ESP_LOGW(TAG, "set_az_sensor_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+  void set_el_sensor_for(const std::string &peer_id, sensor::Sensor *s) {
+    if (peer_id.empty()) { el_ = s; return; }
+    for (auto &kv : peer_decls_) {
+      if (kv.second.id_label == peer_id) { kv.second.el = s; return; }
+    }
+    ESP_LOGW(TAG, "set_el_sensor_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+  void set_wind_sensor_for(const std::string &peer_id, sensor::Sensor *s) {
+    if (peer_id.empty()) { wind_ = s; return; }
+    for (auto &kv : peer_decls_) {
+      if (kv.second.id_label == peer_id) { kv.second.wind = s; return; }
+    }
+    ESP_LOGW(TAG, "set_wind_sensor_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+  void set_mode_sensor_for(const std::string &peer_id, text_sensor::TextSensor *s) {
+    if (peer_id.empty()) { mode_ = s; return; }
+    for (auto &kv : peer_decls_) {
+      if (kv.second.id_label == peer_id) { kv.second.mode = s; return; }
+    }
+    ESP_LOGW(TAG, "set_mode_sensor_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+
+  /* --- Peer registration (called from __init__.py to_code for each declared peer) --- */
+  void register_peer(uint8_t a, uint8_t b, uint8_t c,
+                     uint8_t d, uint8_t e, uint8_t f,
+                     const std::string &id) {
+    std::array<uint8_t, 6> mac{a, b, c, d, e, f};
+    peer_decls_[mac].id_label = id;
+    ESP_LOGD(TAG, "registered peer '%s' %02X:%02X:%02X:%02X:%02X:%02X",
+             id.c_str(), a, b, c, d, e, f);
+  }
+
+  /* --- Config slider write path: local STC or remote peer via mesh --- */
+  void config_set_for_peer(const std::string &peer_id, uint8_t field_id, uint8_t value) {
+    if (peer_id.empty()) {
+      /* Local STC: send directly over UART */
+      char buf[32];
+      int sn = snprintf(buf, sizeof(buf), "!cfg set id=%u val=%u", field_id, value);
+      if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+        ESP_LOGE(TAG, "config_set_for_peer snprintf truncation");
+        return;
+      }
+      write_str_frame_(buf);
+    } else {
+      /* Remote peer: broadcast CONFIG SET_REQ over mesh */
+      const uint8_t *target = find_peer_mac_(peer_id);
+      if (!target) {
+        ESP_LOGW(TAG, "config_set_for_peer: unknown peer_id '%s'", peer_id.c_str());
+        return;
+      }
+      (void)target;  /* target MAC reserved for unicast targeting in Task 12 */
+      uint8_t p[3] = { CFG_OP_SET_REQ, field_id, value };
+      mesh_tx_(MSG_CONFIG, p, 3);
+      ESP_LOGD(TAG, "config_set peer='%s' fid=%u val=%u", peer_id.c_str(), field_id, value);
+    }
+  }
 
   /* --- Phase 4: mesh config setters (called from __init__.py to_code) --- */
   void set_mesh_channel(uint8_t ch) { mesh_channel_ = ch; mesh_enabled_ = true; }
@@ -311,6 +377,27 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 
   /* --- Per-peer last-accepted counter (replay protection) --- */
   std::map<std::array<uint8_t, 6>, uint32_t> peer_last_ctr_;
+
+  /* --- Statically declared peer entities (populated at codegen from YAML) ---
+   * Separate from peers_ (which tracks runtime broadcast state).
+   * PeerDecl is keyed by station MAC exactly as in the YAML peers: block. */
+  struct PeerDecl {
+    std::string id_label;
+    sensor::Sensor *az{nullptr};
+    sensor::Sensor *el{nullptr};
+    sensor::Sensor *wind{nullptr};
+    text_sensor::TextSensor *mode{nullptr};
+    /* Config number entities -- wired by number.py; used for future GET_RESP
+     * read-back (Task 12).  Pointers stored here so the dispatcher can
+     * publish_state when a CFG_OP_GET_RESP arrives. */
+#ifdef USE_NUMBER
+    number::Number *wind_storm{nullptr};
+    number::Number *wind_release{nullptr};
+    number::Number *storm_dwell{nullptr};
+    number::Number *track_thresh{nullptr};
+#endif
+  };
+  std::map<std::array<uint8_t, 6>, PeerDecl> peer_decls_;
 
   /* --- Per-peer application state (gateway election + HA publishing) --- */
   struct PeerEntry {
@@ -726,12 +813,23 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     return std::memcmp(my_mac_, lowest.data(), 6) == 0;
   }
 
-  /* Publish peer telemetry to HA.  Task 9: log only.
-   * Task 11 will wire src MAC → declared peer sensor entities. */
+  /* Publish peer telemetry to HA.  Task 11: look up peer_decls_ by MAC
+   * and call publish_state on each wired entity. */
   void publish_peer_to_ha_(uint8_t src[6], const PeerEntry &e) {
-    ESP_LOGI(TAG, "[gateway] peer %02X..%02X az=%u el=%u wind=%u mode=%s",
-             src[0], src[5], e.az_pct, e.el_pct, e.wind_used, e.mode.c_str());
-    /* Map src MAC to declared peer sensors in Task 11 */
+    std::array<uint8_t, 6> key{src[0], src[1], src[2], src[3], src[4], src[5]};
+    auto it = peer_decls_.find(key);
+    if (it == peer_decls_.end()) {
+      ESP_LOGW(TAG, "[gateway] unknown peer MAC %02X:%02X:%02X:%02X:%02X:%02X -- not in peer_decls_",
+               src[0], src[1], src[2], src[3], src[4], src[5]);
+      return;
+    }
+    auto &d = it->second;
+    ESP_LOGD(TAG, "[gateway] publish peer '%s' az=%u el=%u wind=%u mode=%s",
+             d.id_label.c_str(), e.az_pct, e.el_pct, e.wind_used, e.mode.c_str());
+    if (d.az)   d.az->publish_state(float(e.az_pct));
+    if (d.el)   d.el->publish_state(float(e.el_pct));
+    if (d.wind) d.wind->publish_state(float(e.wind_used));
+    if (d.mode) d.mode->publish_state(e.mode);
   }
 
   /* ---- write_str_frame_: build and write a framed UART packet from a
@@ -752,6 +850,16 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     this->write_byte((uint8_t)hex_digit_(crc & 0x0F));
     this->write_byte(uint8_t('\n'));
     ESP_LOGD(TAG, "cmd->STC: %s (crc=%02X)", s, crc);
+  }
+
+  /* ---- find_peer_mac_: look up a declared peer MAC by id_label.
+   * Returns pointer to static storage inside the map entry (valid for the
+   * lifetime of peer_decls_).  Returns nullptr if not found. ---- */
+  const uint8_t *find_peer_mac_(const std::string &peer_id) {
+    for (const auto &kv : peer_decls_) {
+      if (kv.second.id_label == peer_id) return kv.first.data();
+    }
+    return nullptr;
   }
 
   /* ---- broadcast_mac_: return a pointer to the FF:FF:FF:FF:FF:FF MAC ---- */
@@ -804,6 +912,30 @@ class WindOverrideNumber : public number::Number, public Component {
   }
 
   TrackerBridge *parent_{nullptr};
+};
+
+/* RW config slider: fires config_set_for_peer when the HA user moves a slider.
+ * Works for both local (peer_id == "") and remote peers.  The slider is
+ * optimistic -- published value tracks what was set, not an echo from the STC.
+ * Future Task 12 can wire CFG_OP_GET_RESP → publish_state for read-back. */
+class ConfigNumber : public number::Number {
+ public:
+  void set_parent(TrackerBridge *p) { parent_ = p; }
+  void set_peer_id(const std::string &id) { peer_id_ = id; }
+  void set_field_id(uint8_t fid) { field_id_ = fid; }
+
+ protected:
+  void control(float value) override {
+    if (parent_ == nullptr) return;
+    /* Clamp to uint8 range before sending; slider min/max enforced by ESPHome */
+    uint8_t v = (value < 0.0f) ? 0 : (value > 255.0f) ? 255 : (uint8_t)value;
+    parent_->config_set_for_peer(peer_id_, field_id_, v);
+    this->publish_state(float(v));
+  }
+
+  TrackerBridge *parent_{nullptr};
+  std::string peer_id_{};
+  uint8_t field_id_{0};
 };
 #endif
 

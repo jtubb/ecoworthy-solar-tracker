@@ -14,10 +14,15 @@ DEPENDENCIES = ["tracker_bridge"]
 CONF_AZ = "az"
 CONF_EL = "el"
 CONF_WIND = "wind"
+CONF_PEER_ID = "peer_id"
 
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(CONF_TRACKER_BRIDGE_ID): cv.use_id(TrackerBridge),
+        # Optional peer_id: empty string / absent → local tracker (T1).
+        # Set to a declared peer's id label (e.g. "T2") to attach these
+        # sensors to that peer's slot in peer_decls_.
+        cv.Optional(CONF_PEER_ID, default=""): cv.string_strict,
         cv.Optional(CONF_AZ): sensor.sensor_schema(
             unit_of_measurement=UNIT_PERCENT,
             accuracy_decimals=0,
@@ -40,12 +45,13 @@ CONFIG_SCHEMA = cv.Schema(
 
 async def to_code(config):
     parent = await cg.get_variable(config[CONF_TRACKER_BRIDGE_ID])
+    peer_id = config.get(CONF_PEER_ID, "")
     if CONF_AZ in config:
         s = await sensor.new_sensor(config[CONF_AZ])
-        cg.add(parent.set_az_sensor(s))
+        cg.add(parent.set_az_sensor_for(peer_id, s))
     if CONF_EL in config:
         s = await sensor.new_sensor(config[CONF_EL])
-        cg.add(parent.set_el_sensor(s))
+        cg.add(parent.set_el_sensor_for(peer_id, s))
     if CONF_WIND in config:
         s = await sensor.new_sensor(config[CONF_WIND])
-        cg.add(parent.set_wind_sensor(s))
+        cg.add(parent.set_wind_sensor_for(peer_id, s))
