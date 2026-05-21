@@ -197,8 +197,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   }
 
   void handle_payload_(const std::string &p) {
-    /* "?" is our own poll heard back on the half-duplex bus. */
-    if (p == "?") return;
+    /* Half-duplex self-echo: our own outbound poll ("?") and forwarded
+     * commands ("!wind=...", "!park", ...) loop back on the single-wire
+     * bus.  All start-with-! and start-with-? frames originated here. */
+    if (p == "?" || (!p.empty() && p[0] == '!')) return;
     /* v1 only consumes status replies. */
     if (p.compare(0, 3, "az=") != 0) {
       ESP_LOGD(TAG, "ignored payload: %s", p.c_str());
