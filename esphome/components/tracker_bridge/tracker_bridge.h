@@ -136,9 +136,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       }
       write_str_frame_(buf);
     } else {
-      /* Remote peer: broadcast CONFIG SET_REQ over mesh.
-       * MSG_COMMAND still uses MAC for unicast targeting, so we look up the
-       * peer's last-seen MAC.  CONFIG is broadcast for now (v1 all-accept). */
+      /* Remote peer: broadcast MSG_CONFIG SET_REQ over the mesh.
+       * v1 is broadcast (target_matches_us_ returns true always); every
+       * receiver self-applies the SET.  Per-peer unicast targeting via
+       * the peer's last-seen MAC is deferred to a future refinement. */
       uint8_t p[3] = { CFG_OP_SET_REQ, field_id, value };
       mesh_tx_(MSG_CONFIG, p, 3);
       ESP_LOGD(TAG, "config_set peer='%s' fid=%u val=%u", peer_id.c_str(), field_id, value);
@@ -462,13 +463,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (!pref_tx_counter_.load(&tx_counter_)) tx_counter_ = 0;
     tx_counter_ += CTR_FLUSH_EVERY;
     pref_tx_counter_.save(&tx_counter_);
-    global_preferences->sync();
 
     /* Restore and increment boot epoch for cross-boot replay protection. */
     pref_boot_epoch_ = global_preferences->make_preference<uint16_t>(0xC0DEEEEC);
     if (!pref_boot_epoch_.load(&boot_epoch_)) boot_epoch_ = 0;
     boot_epoch_++;
     pref_boot_epoch_.save(&boot_epoch_);
+
+    /* One sync() flushes both preference writes to flash. */
     global_preferences->sync();
 
     /* Init ESP-NOW.  WiFi must already be associated on mesh_channel_. */
@@ -593,9 +595,13 @@ class TrackerBridge : public Component, public uart::UARTDevice {
                    | ((uint32_t)data[10] << 16)
                    | ((uint32_t)data[11] <<  8)
                    |  (uint32_t)data[12];
-    /* node_name: 32 bytes at offset 13 */
+    /* node_name: 32 bytes at offset 13.  Force byte 31 to NUL after copy
+     * so a malicious sender can't desync our key from make_name_key_'s
+     * 31-char invariant and create a parallel session entry for the same
+     * logical peer. */
     std::array<char, 32> name_key;
     memcpy(name_key.data(), data + 13, 32);
+    name_key[31] = '\0';
 
     size_t plen = (size_t)len - (MESH_HDR + 8);
 
