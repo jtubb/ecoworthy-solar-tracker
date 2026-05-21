@@ -923,10 +923,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     return nullptr;
   }
 
-  /* ---- make_name_key_: build a 32-byte NUL-padded array from a string ---- */
+  /* ---- make_name_key_: build a 32-byte NUL-padded array from a string ----
+   * Caps at 31 chars copied so the 32nd byte is always NUL.  Matches the
+   * 31-char codegen-time cap in __init__.py and the runtime truncation in
+   * mesh_setup_().  Two names that share their first 31 chars would
+   * otherwise collide in peer_decls_ / peer_last_session_ if either filled
+   * all 32 bytes. */
   static std::array<char, 32> make_name_key_(const std::string &name) {
     std::array<char, 32> key{};
-    size_t copy_len = name.size() < 32 ? name.size() : 32;
+    size_t copy_len = name.size() < 31 ? name.size() : 31;
     memcpy(key.data(), name.c_str(), copy_len);
     return key;
   }
