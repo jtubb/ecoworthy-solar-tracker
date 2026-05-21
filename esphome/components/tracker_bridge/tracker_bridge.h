@@ -32,6 +32,7 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/number/number.h"
 #include "esphome/core/preferences.h"
 
 /* ESP-NOW C API -- wrap in extern "C" on the ESP8266 NONOS SDK to
@@ -69,6 +70,12 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   void set_test_broadcast(bool v) { test_broadcast_ = v; }
   /* local_role: 1 = primary (owns wind sensor), 2 = secondary */
   void set_local_role(uint8_t r) { local_role_ = r; }
+
+  /* Bench-helper write path for the wind cache.  Used by the optional
+   * WindOverrideNumber to inject synthetic wind values on a node with
+   * no STC attached.  On a node WITH an STC, the next status poll (~2 s
+   * later) will overwrite this -- don't wire both up at once. */
+  void set_wind_override(uint8_t v) { local_wind_used_ = v; }
 
   void setup() override {
     /* Poll the STC every 2 s.  ESPHome's set_interval handles timing
@@ -550,6 +557,26 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 
 /* Out-of-class definition of the static singleton pointer. */
 TrackerBridge *TrackerBridge::instance_ = nullptr;
+
+/* Bench-helper: HA-controllable wind value for nodes WITHOUT an STC.
+ * Lets you flash a spare ESP-01S as a "secondary" or "primary" without
+ * physical hardware behind it and inject test wind readings from HA's
+ * UI -- proves end-to-end mesh + remote-wind plumbing with only one
+ * real STC on the bench. */
+class WindOverrideNumber : public number::Number, public Component {
+ public:
+  void set_parent(TrackerBridge *p) { parent_ = p; }
+
+ protected:
+  void control(float value) override {
+    if (parent_ == nullptr) return;
+    uint8_t v = (value < 0.0f) ? 0 : (value > 99.0f) ? 99 : (uint8_t) value;
+    parent_->set_wind_override(v);
+    this->publish_state(float(v));
+  }
+
+  TrackerBridge *parent_{nullptr};
+};
 
 }  // namespace tracker_bridge
 }  // namespace esphome
