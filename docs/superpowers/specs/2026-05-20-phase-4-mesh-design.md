@@ -79,25 +79,48 @@ until operator reconfigures (failsafe park triggers everywhere).
 All ESP-NOW broadcasts use a fixed header + variable payload + auth tag:
 
 ```
-┌─────────┬──────────┬─────────┬──────────────┬─────────┐
-│ type 1B │ src 6B   │ ctr 4B  │ payload var  │ tag 8B  │
-├─────────┼──────────┼─────────┼──────────────┼─────────┤
-│ plaintext header (1+6+4=11B) │ encrypted    │ AES-GCM │
-└──────────────────────────────┴──────────────┴─────────┘
+┌─────────┬──────────┬──────────┬──────────┬───────────────┬──────────────┬─────────┐
+│ type 1B │ src 6B   │ epoch 2B │ ctr 4B   │ node_name 32B │ payload var  │ tag 8B  │
+├─────────┼──────────┼──────────┼──────────┼───────────────┼──────────────┼─────────┤
+│ plaintext header (1+6+2+4+32 = 45B)                      │ encrypted    │ AES-GCM │
+└──────────────────────────────────────────────────────────┴──────────────┴─────────┘
 ```
 
 - **`type`**: see message table below
-- **`src`**: sender's 6-byte MAC
-- **`ctr`**: 32-bit monotonic counter per sender (anti-replay)
-- **`payload`**: encrypted with **AES-128-GCM**, key = array PSK
-  truncated SHA-256 to 16 bytes, nonce =
-  `src || ctr || 00 00` (12 bytes total -- standard GCM IV length)
+- **`src`**: sender's 6-byte MAC (link-layer identifier; AAD-covered but not
+  used as the application-layer binding key)
+- **`epoch`**: 16-bit flash-persisted boot counter, incremented +1 on every
+  boot.  Combined with `ctr` for replay protection
+  (`(epoch, ctr)` is monotonic per sender).
+- **`ctr`**: 32-bit per-boot frame counter; resets at each boot but
+  `epoch` ensures cross-boot monotonicity
+- **`node_name`**: 32-byte fixed-width ASCII, NUL-padded, sourced from
+  ESPHome's `esphome.name` field via `App.get_name()`.  This is the
+  **application-layer binding key** -- HA entities are wired to peers
+  by `node_name`, not MAC.  Codegen rejects names longer than 31 chars.
+- **`payload`**: encrypted with **AES-128-GCM**, key = SHA-256(PSK)
+  truncated to 16 bytes, nonce = `src(6) || epoch(2) || ctr(4)`
+  (12 bytes total -- standard GCM IV length).  Including epoch in the
+  nonce gives each (mac, epoch) pair its own counter space.
 - **`tag`**: 8-byte GCM authentication tag
-- **AAD** (additional authenticated data) covers the 11-byte plaintext
-  header (`type || src || ctr`), so a tampered type/src/ctr is rejected
+- **AAD** (additional authenticated data) covers the entire 45-byte
+  plaintext header, so a tampered type/src/epoch/ctr/node_name is
+  rejected
 
-Max packet = 11 + payload + 8 = well under ESP-NOW's 250-byte limit
+Max packet = 45 + payload + 8 = well under ESP-NOW's 250-byte limit
 for all defined message types.
+
+### Replay protection
+
+Receivers maintain a per-sender `peer_last_session_` table keyed by
+`node_name` (NOT MAC) containing the highest accepted `(epoch, ctr)`
+pair.  An incoming frame is accepted only if its `(epoch, ctr)` is
+strictly greater (lexicographic compare).  Same-boot replay is rejected
+because `ctr` only grows; cross-boot replay is rejected because `epoch`
+only grows.  Reflashing a node erases its persisted counter, but the
+fresh `epoch` value (incremented from its previous persisted value)
+keeps the comparison monotonic -- no "stuck peer counter" recovery
+needed when a node is re-flashed.
 
 ### Message types
 
