@@ -38,6 +38,10 @@
 #include "esphome/components/number/number.h"
 #endif
 
+#ifdef USE_BUTTON
+#include "esphome/components/button/button.h"
+#endif
+
 /* ESP-NOW C API -- wrap in extern "C" on the ESP8266 NONOS SDK to
  * avoid C++ name-mangling issues with the SDK's C headers. */
 extern "C" {
@@ -80,6 +84,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * no STC attached.  On a node WITH an STC, the next status poll (~2 s
    * later) will overwrite this -- don't wire both up at once. */
   void set_wind_override(uint8_t v) { local_wind_used_ = v; }
+
+  /* HA->mesh broadcast methods (callable from buttons/numbers) */
+  void broadcast_force_park()    { mesh_tx_command_(broadcast_mac_(), CMD_FORCE_PARK,    0, 0); }
+  void broadcast_force_release() { mesh_tx_command_(broadcast_mac_(), CMD_FORCE_RELEASE, 0, 0); }
+  void broadcast_stop()          { mesh_tx_command_(broadcast_mac_(), CMD_STOP,          0, 0); }
+  void send_goto(const uint8_t target[6], uint8_t az, uint8_t el)            { mesh_tx_command_(target, CMD_GOTO,      az,     el); }
+  void send_jog(const uint8_t target[6], uint8_t ax_dir, uint8_t dur_100ms) { mesh_tx_command_(target, CMD_JOG,       ax_dir, dur_100ms); }
+  void send_calibrate(const uint8_t target[6])                               { mesh_tx_command_(target, CMD_CALIBRATE, 0,      0); }
 
   void setup() override {
     /* Poll the STC every 2 s.  ESPHome's set_interval handles timing
@@ -259,6 +271,20 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * secondary nodes receive WIND from the primary and forward to their STC. */
   static constexpr uint8_t ROLE_PRIMARY   = 1;
   static constexpr uint8_t ROLE_SECONDARY = 2;
+
+  /* --- Command codes (MSG_COMMAND payload byte 6) --- */
+  static constexpr uint8_t CMD_FORCE_PARK    = 1;
+  static constexpr uint8_t CMD_FORCE_RELEASE = 2;
+  static constexpr uint8_t CMD_GOTO          = 3;
+  static constexpr uint8_t CMD_JOG           = 4;
+  static constexpr uint8_t CMD_STOP          = 5;
+  static constexpr uint8_t CMD_CALIBRATE     = 6;
+
+  /* --- CONFIG operation codes (MSG_CONFIG payload byte 0) --- */
+  static constexpr uint8_t CFG_OP_GET_REQ    = 1;
+  static constexpr uint8_t CFG_OP_GET_RESP   = 2;
+  static constexpr uint8_t CFG_OP_SET_REQ    = 3;
+  static constexpr uint8_t CFG_OP_SET_ACK    = 4;
 
   /* --- Cached STC state, populated by handle_payload_ --- */
   uint8_t local_az_pct_{0};
@@ -493,7 +519,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         /* Forward wind value to local STC via the !wind=NN framed command.
          * Secondary nodes relay primary's wind reading to their STC so the
          * STC's own storm_check can trip without a local wind sensor. */
-        send_command_frame_("!wind=", p[0]);
+        {
+          char buf[16];
+          int sn = snprintf(buf, sizeof(buf), "!wind=%u", (unsigned)p[0]);
+          if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+            ESP_LOGE(TAG, "MSG_WIND snprintf truncation");
+            break;
+          }
+          write_str_frame_(buf);
+        }
         break;
       case MSG_GATEWAY_HB: {
         /* Drop self-echo before any peer-state mutation. */
@@ -513,6 +547,101 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         e.mode = mode_from_code_(p[3]);
         /* If we're the acting gateway, publish to HA for this peer */
         if (is_acting_gateway_()) publish_peer_to_ha_(src, e);
+        break;
+      }
+      case MSG_COMMAND: {
+        if (plen < 9) return;
+        /* Target occupies the first 6 bytes of the plaintext payload.
+         * If target is not broadcast and not us, ignore this command. */
+        bool is_bcast = std::all_of(p, p + 6, [](uint8_t b) { return b == 0xFF; });
+        if (!is_bcast && std::memcmp(p, my_mac_, 6) != 0) return;
+        uint8_t cmd = p[6], a1 = p[7], a2 = p[8];
+        switch (cmd) {
+          case CMD_FORCE_PARK:
+            write_str_frame_("!park");
+            break;
+          case CMD_FORCE_RELEASE:
+            /* !release clears operator-forced storm (storm_forced) only.
+             * Wind-driven failsafe (wind_failsafe) is intentionally NOT
+             * cleared here: a remote release must not override an active
+             * wind sensor reading or watchdog failsafe. */
+            write_str_frame_("!release");
+            break;
+          case CMD_STOP:
+            write_str_frame_("!stop");
+            break;
+          case CMD_GOTO: {
+            char buf[32];
+            int sn = snprintf(buf, sizeof(buf), "!goto az=%u el=%u", a1, a2);
+            if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+              ESP_LOGE(TAG, "CMD_GOTO snprintf truncation");
+              break;
+            }
+            write_str_frame_(buf);
+            break;
+          }
+          case CMD_JOG: {
+            uint8_t axis   = (a1 >> 7) & 1;
+            uint8_t dir    =  a1       & 1;
+            uint16_t dur_ms = (uint16_t)a2 * 100;
+            char buf[40];
+            int sn = snprintf(buf, sizeof(buf), "!jog ax=%u dir=%c ms=%u",
+                              axis, dir ? '+' : '-', (unsigned)dur_ms);
+            if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+              ESP_LOGE(TAG, "CMD_JOG snprintf truncation");
+              break;
+            }
+            write_str_frame_(buf);
+            break;
+          }
+          case CMD_CALIBRATE:
+            write_str_frame_("!cal");
+            break;
+          default:
+            ESP_LOGD(TAG, "MSG_COMMAND unknown cmd=%u", cmd);
+            break;
+        }
+        break;
+      }
+      case MSG_CONFIG: {
+        if (plen < 2) return;
+        uint8_t op = p[0], field_id = p[1];
+        switch (op) {
+          case CFG_OP_GET_REQ:
+            /* Reply with our local STC's cached config value.
+             * v1: accept all GET_REQ (target matching refined in Task 11). */
+            if (target_matches_us_(src)) {
+              char buf[20];
+              int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", field_id);
+              if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+                ESP_LOGE(TAG, "CFG_GET snprintf truncation");
+                break;
+              }
+              write_str_frame_(buf);
+              /* STC reply arrives via UART RX path -> published to HA */
+            }
+            break;
+          case CFG_OP_SET_REQ:
+            if (target_matches_us_(src) && plen >= 3) {
+              uint8_t val = p[2];   /* u8 fields; u16 needs plen>=4 */
+              char buf[32];
+              int sn = snprintf(buf, sizeof(buf), "!cfg set id=%u val=%u",
+                                field_id, val);
+              if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+                ESP_LOGE(TAG, "CFG_SET snprintf truncation");
+                break;
+              }
+              write_str_frame_(buf);
+            }
+            break;
+          case CFG_OP_GET_RESP:
+          case CFG_OP_SET_ACK:
+            /* Update HA peer-config entity, see Task 11 */
+            break;
+          default:
+            ESP_LOGD(TAG, "MSG_CONFIG unknown op=%u", op);
+            break;
+        }
         break;
       }
       default:
@@ -604,32 +733,51 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* Map src MAC to declared peer sensors in Task 11 */
   }
 
-  /* ---- send_command_frame_: build and write a !cmd=NN framed UART packet ----
-   * Format: AA 55 <ASCII cmd string> <2 hex CRC8> LF
+  /* ---- write_str_frame_: build and write a framed UART packet from a
+   * complete ASCII payload string.  Replaces the old send_command_frame_
+   * (prefix+value variant) -- all callers now build the string themselves
+   * with snprintf before calling this helper.
+   *
+   * Format: AA 55 <ASCII payload> <2 hex CRC8> LF
    * CRC covers only the ASCII payload bytes -- byte-identical to the STC's
    * uart_send_frame / crc8_update (see EcoWorthyFirmware/src/main.c). */
-  void send_command_frame_(const char *prefix, uint8_t value) {
-    char buf[16];
-    int sn = snprintf(buf, sizeof(buf), "%s%u", prefix, (unsigned)value);
-    /* sn == 0 is an empty payload (shouldn't happen); sn >= sizeof(buf) means
-     * snprintf would have written more than fits -- truncation occurred and the
-     * buffer contains a garbage-truncated string.  Bail in either case. */
-    if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
-      ESP_LOGE(TAG, "send_command_frame_ snprintf truncation (sn=%d)", sn);
-      return;
-    }
-    size_t len = (size_t)sn;
+  void write_str_frame_(const char *s) {
     uint8_t crc = 0;
-    for (size_t i = 0; i < len; i++)
-      crc = crc8_step_(crc, (uint8_t)buf[i]);
+    for (const char *q = s; *q; q++) crc = crc8_step_(crc, (uint8_t)*q);
     this->write_byte(0xAA);
     this->write_byte(0x55);
-    for (size_t i = 0; i < len; i++)
-      this->write_byte((uint8_t)buf[i]);
+    for (const char *q = s; *q; q++) this->write_byte((uint8_t)*q);
     this->write_byte((uint8_t)hex_digit_(crc >> 4));
     this->write_byte((uint8_t)hex_digit_(crc & 0x0F));
     this->write_byte(uint8_t('\n'));
-    ESP_LOGD(TAG, "cmd->STC: %s (crc=%02X)", buf, crc);
+    ESP_LOGD(TAG, "cmd->STC: %s (crc=%02X)", s, crc);
+  }
+
+  /* ---- broadcast_mac_: return a pointer to the FF:FF:FF:FF:FF:FF MAC ---- */
+  static const uint8_t *broadcast_mac_() {
+    static uint8_t b[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    return b;
+  }
+
+  /* ---- mesh_tx_command_: assemble and send a MSG_COMMAND mesh frame ---- */
+  void mesh_tx_command_(const uint8_t target[6], uint8_t cmd,
+                        uint8_t a1, uint8_t a2) {
+    uint8_t payload[9];
+    memcpy(payload, target, 6);
+    payload[6] = cmd;
+    payload[7] = a1;
+    payload[8] = a2;
+    mesh_tx_(MSG_COMMAND, payload, 9);
+  }
+
+  /* ---- target_matches_us_: v1 always returns true (accept all GET_REQ) ---
+   * Proper per-MAC targeting will be refined in Task 11 once the gateway
+   * can address specific peers.  For now every tracker responds to every
+   * CONFIG request; the gateway de-dups by tracking which response is from
+   * which peer. */
+  bool target_matches_us_(const uint8_t * /*src*/) {
+    /* TODO(Task 11): compare src against my_mac_ for unicast config ops */
+    return true;
   }
 };
 
@@ -654,6 +802,37 @@ class WindOverrideNumber : public number::Number, public Component {
     this->publish_state(float(v));
   }
 
+  TrackerBridge *parent_{nullptr};
+};
+#endif
+
+#ifdef USE_BUTTON
+/* HA command buttons that broadcast mesh commands to all trackers.
+ * Each button class holds a pointer to the TrackerBridge that owns
+ * the mesh TX path, and calls the corresponding broadcast method on
+ * press.  Guarded by USE_BUTTON so the include only resolves when the
+ * button framework is actually loaded (mirrors USE_NUMBER above). */
+class ForceParkButton : public button::Button {
+ public:
+  void set_parent(TrackerBridge *p) { parent_ = p; }
+ protected:
+  void press_action() override { if (parent_) parent_->broadcast_force_park(); }
+  TrackerBridge *parent_{nullptr};
+};
+
+class ForceReleaseButton : public button::Button {
+ public:
+  void set_parent(TrackerBridge *p) { parent_ = p; }
+ protected:
+  void press_action() override { if (parent_) parent_->broadcast_force_release(); }
+  TrackerBridge *parent_{nullptr};
+};
+
+class StopButton : public button::Button {
+ public:
+  void set_parent(TrackerBridge *p) { parent_ = p; }
+ protected:
+  void press_action() override { if (parent_) parent_->broadcast_stop(); }
   TrackerBridge *parent_{nullptr};
 };
 #endif
