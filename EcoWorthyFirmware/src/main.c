@@ -792,9 +792,17 @@ static __xdata storm_phase_t storm_phase = STORM_PARKING;
 static __xdata unsigned long storm_dwell_start_ms = 0;
 static __xdata unsigned char storm_parking = 0;
 
-/* Operator-forced storm (via HA / mesh).  Independent of wind-based
- * entry: when set, storm_check() forces ST_STORM regardless of wind. */
+/* Operator-forced storm (via HA / mesh).  Sticky: set by !park,
+ * cleared only by !release.  Blocks dwell exit while set. */
 static __xdata unsigned char storm_forced = 0;
+
+/* Auto-managed wind failsafe (only when wind_source==1, i.e. remote).
+ * Set by storm_check() when remote-wind broadcasts have been silent
+ * for >= REMOTE_WIND_TIMEOUT_MS; cleared automatically as soon as a
+ * fresh broadcast arrives.  Also triggers storm entry like storm_forced,
+ * but does NOT block dwell exit -- so once broadcasts resume, the
+ * normal dwell-then-exit path runs. */
+static __xdata unsigned char wind_failsafe = 0;
 
 static unsigned char ns_duty_locked(void) { return ns_duty_lockout_end != 0; }
 static unsigned char ew_duty_locked(void) { return ew_duty_lockout_end != 0; }
@@ -1555,8 +1563,8 @@ static void storm_check(state_t *state) {
     if (now - storm_scan_last < STORM_SCAN_MS) return;
     storm_scan_last = now;
 
-    /* Forced storm: enter ST_STORM regardless of wind / cal state. */
-    if (storm_forced && *state != ST_STORM) {
+    /* Forced storm: enter ST_STORM on operator !park OR auto wind-failsafe. */
+    if ((storm_forced || wind_failsafe) && *state != ST_STORM) {
         ns_duty_on_ms = 0; ew_duty_on_ms = 0;
         ns_duty_lockout_end = 0; ew_duty_lockout_end = 0;
         duty_last_tick_ms = millis();
@@ -1576,14 +1584,16 @@ static void storm_check(state_t *state) {
         w = wind_mps(adc_read_avg(ADC_CH_WIND, 8));
         wind_mps_cached = w;
     } else {
-        /* Remote: use cached value from !wind= broadcast.
-         * Failsafe: if no update in REMOTE_WIND_TIMEOUT_MS, force storm. */
+        /* Remote: use cached value from !wind= broadcast.  Failsafe
+         * arms after REMOTE_WIND_TIMEOUT_MS of silence and auto-clears
+         * the moment a fresh broadcast arrives.  Operator !park is a
+         * separate flag that stays sticky until !release. */
         unsigned long age = now - remote_wind_last_update_ms;
         if (remote_wind_last_update_ms == 0 || age > REMOTE_WIND_TIMEOUT_MS) {
-            /* No broadcast yet, or stale: force storm */
-            storm_forced = 1;
+            wind_failsafe = 1;
             w = wind_storm_mps;   /* report at-threshold so storm logic proceeds */
         } else {
+            wind_failsafe = 0;
             w = remote_wind_mps;
             wind_mps_cached = w;  /* mirror to display */
         }
@@ -1661,14 +1671,18 @@ static void storm_tick(state_t *state) {
         elapsed = now - storm_dwell_start_ms;
         need    = (unsigned long)storm_dwell_min * 60000UL;
 
-        if (elapsed >= need && !storm_forced) {
+        if (elapsed >= need && !storm_forced && !wind_failsafe) {
             lcd_clear();
             track_last_check_ms = millis();   /* fresh tracking eval */
             *state = ST_TRACK;
             return;
         }
 
-        remain = (need - elapsed + 59999UL) / 60000UL;   /* ceil minutes */
+        /* Defensive: clamp before the unsigned subtraction so a stuck
+         * storm (e.g. lingering storm_forced from !park) does not
+         * underflow the display to "99m". */
+        remain = (elapsed >= need) ? 0
+                                   : (need - elapsed + 59999UL) / 60000UL;
         if (remain > 99) remain = 99;
         lcd_goto(0, 0); lcd_print_padded("STORM  HOLD", 16);
         lcd_goto(1, 0);
@@ -2235,6 +2249,7 @@ void main(void) {
      * stale SRAM values), starting with non-zero storm_forced/goto/remote
      * bits would falsely re-enter storm or fire stale gotos at boot. */
     storm_forced = 0;
+    wind_failsafe = 0;
     remote_wind_mps = 0;
     remote_wind_last_update_ms = 0;
     goto_active = 0;

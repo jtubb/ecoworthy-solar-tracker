@@ -32,8 +32,11 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
-#include "esphome/components/number/number.h"
 #include "esphome/core/preferences.h"
+
+#ifdef USE_NUMBER
+#include "esphome/components/number/number.h"
+#endif
 
 /* ESP-NOW C API -- wrap in extern "C" on the ESP8266 NONOS SDK to
  * avoid C++ name-mangling issues with the SDK's C headers. */
@@ -558,6 +561,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 /* Out-of-class definition of the static singleton pointer. */
 TrackerBridge *TrackerBridge::instance_ = nullptr;
 
+#ifdef USE_NUMBER
 /* Bench-helper: HA-controllable wind value for nodes WITHOUT an STC.
  * Lets you flash a spare ESP-01S as a "secondary" or "primary" without
  * physical hardware behind it and inject test wind readings from HA's
@@ -577,6 +581,7 @@ class WindOverrideNumber : public number::Number, public Component {
 
   TrackerBridge *parent_{nullptr};
 };
+#endif
 
 }  // namespace tracker_bridge
 }  // namespace esphome
