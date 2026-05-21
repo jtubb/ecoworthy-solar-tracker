@@ -176,6 +176,16 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     this->set_interval("poll", 2000, [this]() { this->send_poll_(); });
     ESP_LOGCONFIG(TAG, "tracker_bridge configured");
 
+    /* DEBUG: dump peer_decls_ state after register_peer calls from codegen
+     * should have completed.  If size is 0 here, codegen never emitted the
+     * register_peer calls -- problem is in __init__.py. */
+    ESP_LOGI(TAG, "setup(): peer_decls_ size=%u", (unsigned) peer_decls_.size());
+    for (const auto &kv : peer_decls_) {
+      char hex[65] = {};
+      for (int i = 0; i < 32; i++) sprintf(hex + i * 2, "%02X", (uint8_t) kv.first[i]);
+      ESP_LOGI(TAG, "  declared key[0..31]=%s", hex);
+    }
+
     if (mesh_enabled_) {
       mesh_setup_();
     }
@@ -888,15 +898,16 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (it == peer_decls_.end()) {
       ESP_LOGW(TAG, "[gateway] unknown peer node_name '%.32s' -- not in peer_decls_",
                name_key.data());
-      /* Diagnostic: dump first 16 bytes of inbound key + each registered key
+      /* Diagnostic: dump full 32 bytes of inbound key + each registered key
        * so we can see exactly where they diverge. */
-      char hex_in[33] = {};
-      for (int i = 0; i < 16; i++) sprintf(hex_in + i * 2, "%02X", (uint8_t) name_key[i]);
-      ESP_LOGW(TAG, "  inbound  key[0..15]=%s", hex_in);
+      char hex_in[65] = {};
+      for (int i = 0; i < 32; i++) sprintf(hex_in + i * 2, "%02X", (uint8_t) name_key[i]);
+      ESP_LOGW(TAG, "  inbound  key[0..31]=%s", hex_in);
+      ESP_LOGW(TAG, "  peer_decls_ size=%u", (unsigned) peer_decls_.size());
       for (const auto &kv : peer_decls_) {
-        char hex_reg[33] = {};
-        for (int i = 0; i < 16; i++) sprintf(hex_reg + i * 2, "%02X", (uint8_t) kv.first[i]);
-        ESP_LOGW(TAG, "  declared key[0..15]=%s", hex_reg);
+        char hex_reg[65] = {};
+        for (int i = 0; i < 32; i++) sprintf(hex_reg + i * 2, "%02X", (uint8_t) kv.first[i]);
+        ESP_LOGW(TAG, "  declared key[0..31]=%s", hex_reg);
       }
       return;
     }
