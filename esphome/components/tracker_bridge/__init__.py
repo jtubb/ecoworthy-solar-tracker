@@ -98,6 +98,10 @@ async def to_code(config):
         # log to the device, but print() lands in `esphome compile` stdout.
         print(f"[tracker_bridge.__init__] CONF_MESH keys: {list(mesh.keys())}")
         print(f"[tracker_bridge.__init__] CONF_PEERS value: {peers!r}")
+        # DEBUG: hardcoded call outside the loop -- if THIS doesn't show up in
+        # the device log as "registered peer 'ZZZ-CODEGEN-TEST'" / setup()
+        # peer_decls_ size>=1, then the entire to_code path is broken.
+        cg.add(var.register_peer("ZZZ-CODEGEN-TEST"))
         for peer_name in peers:
             print(f"[tracker_bridge.__init__]   emitting register_peer({peer_name!r})")
             cg.add(var.register_peer(peer_name))
