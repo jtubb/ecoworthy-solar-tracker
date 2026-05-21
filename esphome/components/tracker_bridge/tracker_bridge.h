@@ -58,6 +58,7 @@ extern "C" {
 #include <cstring>
 #include <map>
 #include <array>
+#include <algorithm>
 
 namespace esphome {
 namespace tracker_bridge {
