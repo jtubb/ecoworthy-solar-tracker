@@ -80,11 +80,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     }
 
     if (mesh_enabled_ && test_broadcast_) {
-      /* Bench validation: broadcast a 2-byte test packet 3 s after boot. */
-      this->set_timeout(3000, [this]() {
+      /* Bench validation: broadcast a 2-byte test packet every 5 s.
+       * Periodic (not one-shot) so a slow WiFi/channel settle doesn't
+       * leave the window closed before the radio is ready, and so the
+       * receiver gets many chances to log a match. */
+      this->set_interval("mesh_test", 5000, [this]() {
         uint8_t test[] = {0xDE, 0xAD};
         mesh_tx_(99, test, 2);  /* type 99 = test, not an assigned type */
-        ESP_LOGI(TAG, "test broadcast sent");
+        ESP_LOGI(TAG, "test broadcast sent (ctr=%u)", (unsigned) tx_counter_);
       });
     }
   }
