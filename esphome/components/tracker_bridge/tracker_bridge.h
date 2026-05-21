@@ -272,6 +272,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   uint8_t mesh_channel_{0};
   std::string mesh_psk_{};
   uint8_t mesh_key_[16]{};      /* derived from psk_ via SHA-256 trunc (deterministic) */
+  uint8_t my_mac_[6]{};         /* cached at mesh_setup_; never changes at runtime */
   std::string tracker_id_{};
   bool mesh_enabled_{false};
   bool test_broadcast_{false};
@@ -300,6 +301,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 
   /* ---- mesh_setup_: derive key, restore counter, init ESP-NOW ---- */
   void mesh_setup_() {
+    /* Cache own MAC once; used by self-guard in mesh_dispatch_ and
+     * gateway election -- avoids repeated WiFi SDK calls at runtime. */
+    WiFi.macAddress(my_mac_);
+
     /* Derive a 16-byte AES key from the passphrase via SHA-256 truncation.
      * Deterministic: operators can use a human-readable string in YAML. */
     SHA256 sha;
@@ -491,12 +496,16 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         send_command_frame_("!wind=", p[0]);
         break;
       case MSG_GATEWAY_HB: {
+        /* Drop self-echo before any peer-state mutation. */
+        if (std::memcmp(src, my_mac_, 6) == 0) break;
         std::array<uint8_t, 6> key{src[0],src[1],src[2],src[3],src[4],src[5]};
         peers_[key].last_gateway_hb_ms = millis();
         break;
       }
       case MSG_TELEMETRY: {
         if (plen < 4) return;
+        /* Drop self-echo before any peer-state mutation. */
+        if (std::memcmp(src, my_mac_, 6) == 0) break;
         std::array<uint8_t, 6> key{src[0],src[1],src[2],src[3],src[4],src[5]};
         auto &e = peers_[key];
         e.last_telemetry_ms = millis();
@@ -577,16 +586,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * this node itself has WiFi connectivity. */
   bool is_acting_gateway_() {
     if (!WiFi.isConnected()) return false;
-    uint8_t my_mac[6];
-    WiFi.macAddress(my_mac);
     uint32_t now = millis();
     /* Find lowest MAC currently broadcasting GATEWAY_HB within HB_STALE_MS */
-    std::array<uint8_t, 6> lowest{my_mac[0],my_mac[1],my_mac[2],my_mac[3],my_mac[4],my_mac[5]};
+    std::array<uint8_t, 6> lowest{my_mac_[0],my_mac_[1],my_mac_[2],my_mac_[3],my_mac_[4],my_mac_[5]};
     for (const auto &kv : peers_) {
       if (now - kv.second.last_gateway_hb_ms > HB_STALE_MS) continue;
       if (kv.first < lowest) lowest = kv.first;
     }
-    return std::memcmp(my_mac, lowest.data(), 6) == 0;
+    return std::memcmp(my_mac_, lowest.data(), 6) == 0;
   }
 
   /* Publish peer telemetry to HA.  Task 9: log only.
