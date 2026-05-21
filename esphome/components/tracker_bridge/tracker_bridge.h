@@ -20,7 +20,7 @@
  * (uart_frame_feed / crc8_update in EcoWorthyFirmware/src/main.c).
  * If either side changes the algorithm, both must change.
  *
- * Phase 4: ESP-NOW mesh broadcast with AES-128-CCM authenticated
+ * Phase 4: ESP-NOW mesh broadcast with AES-128-GCM authenticated
  * encryption.  mesh_tx_/mesh_rx_/mesh_dispatch_ live in this file.
  * Set `mesh: test_broadcast: true` in YAML to emit a 2-byte test
  * packet 3 s after boot (for bench validation with a listener node);
@@ -42,7 +42,7 @@ extern "C" {
 
 #include <Crypto.h>
 #include <AES.h>
-#include <CCM.h>
+#include <GCM.h>
 #include <SHA1.h>
 
 #include <string>
@@ -221,7 +221,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   text_sensor::TextSensor *mode_{nullptr};
 
   /* ================================================================
-   * Phase 4: ESP-NOW mesh -- AES-128-CCM authenticated broadcast
+   * Phase 4: ESP-NOW mesh -- AES-128-GCM authenticated broadcast
    * ================================================================ */
 
   /* --- Mesh config (populated by YAML via setters above) --- */
@@ -299,7 +299,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    *   [1..6]   src MAC    (6 bytes)
    *   [7..10]  ctr        (4 bytes, big-endian)
    *   [11..]   ciphertext (plen bytes)
-   *   [..+8]   AES-CCM tag (8 bytes)
+   *   [..+8]   AES-GCM tag (8 bytes)
    *
    * AAD covers bytes [0..10] (type + header), so a tampered type or
    * counter is detected by the tag check.
@@ -331,23 +331,23 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       global_preferences->sync();
     }
 
-    /* AES-128-CCM encrypt */
-    CCM<AES128> ccm;
-    ccm.setKey(mesh_key_, 16);
+    /* AES-128-GCM encrypt */
+    GCM<AES128> gcm;
+    gcm.setKey(mesh_key_, 16);
     /* Nonce: src(6) || ctr(4) || 0x0000 = 12 bytes */
     uint8_t nonce[12];
     memcpy(nonce, mac, 6);
     memcpy(nonce + 6, pkt + 7, 4);
     nonce[10] = 0;
     nonce[11] = 0;
-    ccm.setIV(nonce, 12);
-    ccm.setTagSize(8);
+    gcm.setIV(nonce, 12);
+    gcm.setTagSize(8);
     /* AAD: type byte + src MAC + counter */
-    ccm.addAuthData(pkt, 1 + 6 + 4);
+    gcm.addAuthData(pkt, 1 + 6 + 4);
     /* Encrypt payload into pkt at byte 11; tag follows at pkt[11+plen] */
-    ccm.encrypt(pkt + 11, payload_in, plen);
+    gcm.encrypt(pkt + 11, payload_in, plen);
     uint8_t tag[8];
-    ccm.computeTag(tag, 8);
+    gcm.computeTag(tag, 8);
     memcpy(pkt + 11 + plen, tag, 8);
 
     /* Broadcast */
@@ -379,25 +379,25 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       return;
     }
 
-    /* AES-128-CCM decrypt */
-    CCM<AES128> ccm;
-    ccm.setKey(mesh_key_, 16);
+    /* AES-128-GCM decrypt */
+    GCM<AES128> gcm;
+    gcm.setKey(mesh_key_, 16);
     uint8_t nonce[12];
     memcpy(nonce, src, 6);
     memcpy(nonce + 6, data + 7, 4);
     nonce[10] = 0;
     nonce[11] = 0;
-    ccm.setIV(nonce, 12);
-    ccm.setTagSize(8);
-    ccm.addAuthData(data, 1 + 6 + 4);
+    gcm.setIV(nonce, 12);
+    gcm.setTagSize(8);
+    gcm.addAuthData(data, 1 + 6 + 4);
     uint8_t plaintext[64];
     if (plen > sizeof(plaintext)) {
       ESP_LOGD(TAG, "oversized payload %u from %02X..%02X", (unsigned)plen,
                src[0], src[5]);
       return;
     }
-    ccm.decrypt(plaintext, data + 11, plen);
-    if (!ccm.checkTag(data + 11 + plen, 8)) {
+    gcm.decrypt(plaintext, data + 11, plen);
+    if (!gcm.checkTag(data + 11 + plen, 8)) {
       ESP_LOGD(TAG, "AES auth fail src=%02X..%02X", src[0], src[5]);
       return;
     }
