@@ -30,7 +30,7 @@ the base-station AP.
 | 4 | Multi-gateway dedup | Lowest-MAC election with periodic heartbeat, automatic failover |
 | 5 | Wind-loss failsafe | Fail-safe to storm-park after 3–4 missed broadcasts (~15–20 s) |
 | 6 | HA command surface | Full bidirectional incl. movement (`force_park`, `force_release`, `goto`, `jog`, `stop`) plus calibration trigger |
-| 7 | Security | AES-128-CCM + monotonic counter, per-array PSK |
+| 7 | Security | AES-128-GCM + monotonic counter, per-array PSK |
 | 8 | Config | Get-anywhere, Set-only-on-tunable-fields (cal data is read-only over mesh) |
 
 ## High-level architecture
@@ -82,16 +82,19 @@ All ESP-NOW broadcasts use a fixed header + variable payload + auth tag:
 ┌─────────┬──────────┬─────────┬──────────────┬─────────┐
 │ type 1B │ src 6B   │ ctr 4B  │ payload var  │ tag 8B  │
 ├─────────┼──────────┼─────────┼──────────────┼─────────┤
-│ plaintext header (1+6+4=11B) │ encrypted    │ AES-CCM │
+│ plaintext header (1+6+4=11B) │ encrypted    │ AES-GCM │
 └──────────────────────────────┴──────────────┴─────────┘
 ```
 
 - **`type`**: see message table below
 - **`src`**: sender's 6-byte MAC
 - **`ctr`**: 32-bit monotonic counter per sender (anti-replay)
-- **`payload`**: encrypted with **AES-128-CCM**, key = array PSK,
-  nonce = `src || ctr || 00 00` (15 bytes total)
-- **`tag`**: 8-byte CCM authentication tag
+- **`payload`**: encrypted with **AES-128-GCM**, key = array PSK
+  truncated SHA-256 to 16 bytes, nonce =
+  `src || ctr || 00 00` (12 bytes total -- standard GCM IV length)
+- **`tag`**: 8-byte GCM authentication tag
+- **AAD** (additional authenticated data) covers the 11-byte plaintext
+  header (`type || src || ctr`), so a tampered type/src/ctr is rejected
 
 Max packet = 11 + payload + 8 = well under ESP-NOW's 250-byte limit
 for all defined message types.
@@ -373,12 +376,13 @@ Per-tracker control buttons:
 
 ## Open implementation questions (for the plan phase)
 
-1. **AES-CCM library**: use the Arduino `Crypto` library by rweather
-   (well-supported, header-only-friendly, has `AES_CCM` directly).
-   Already compatible with ESPHome's Arduino framework on ESP8266.
-   Flash budget verification deferred to first build; if tight, fall
-   back to a hand-rolled `aes-128` + minimal CCM (only the bits we
-   use) at ~2 KB.
+1. **AEAD library**: resolved during P4-7 build. The Arduino `Crypto`
+   library by rweather (PlatformIO slug `rweather/Crypto`) packages
+   `<AES.h>` and `<GCM.h>` but NOT `<CCM.h>` -- switched to AES-128-GCM
+   for equivalent authenticated-encryption guarantees with the same
+   wire layout, AAD, and 8-byte tag. SHA-256 (instead of the spec's
+   original SHA-1) for PSK -> AES key derivation, also for library
+   packaging reasons.
 2. **Counter persistence policy**: 100-tick flush interval is a
    starting estimate. May need tuning based on observed flash wear.
 3. **STC `!cfg` command parser implementation**: the existing

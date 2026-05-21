@@ -2,14 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a single-hop ESP-NOW mesh over the Phase 3 bridge that lets up to 10 trackers share wind/storm state, expose all telemetry and config to Home Assistant via dynamic gateway election, and accept HA commands (force park/release, goto, jog, calibrate) over an AES-128-CCM authenticated channel.
+**Goal:** Build a single-hop ESP-NOW mesh over the Phase 3 bridge that lets up to 10 trackers share wind/storm state, expose all telemetry and config to Home Assistant via dynamic gateway election, and accept HA commands (force park/release, goto, jog, calibrate) over an AES-128-GCM authenticated channel.
 
-**Architecture:** Each tracker runs identical code; behavior diverges by configuration (static `role: primary | secondary`) and runtime state (WiFi up = gateway candidate, lowest MAC of currently-up nodes is the acting gateway). The wire protocol extends Phase 3's `\xAA\x55`-framed UART with new `!` command payloads on the STC side, and adds an ESP-NOW broadcast layer on the ESP side with AES-CCM auth and a 32-bit anti-replay counter. See `docs/superpowers/specs/2026-05-20-phase-4-mesh-design.md` for full design rationale.
+**Architecture:** Each tracker runs identical code; behavior diverges by configuration (static `role: primary | secondary`) and runtime state (WiFi up = gateway candidate, lowest MAC of currently-up nodes is the acting gateway). The wire protocol extends Phase 3's `\xAA\x55`-framed UART with new `!` command payloads on the STC side, and adds an ESP-NOW broadcast layer on the ESP side with AES-GCM auth and a 32-bit anti-replay counter. See `docs/superpowers/specs/2026-05-20-phase-4-mesh-design.md` for full design rationale.
 
 **Tech Stack:**
 - STC15F2K60S2 firmware: SDCC 4.x, GNU Make, stcgal
 - ESP-01S firmware: ESPHome Arduino framework on ESP8266, with custom external_component (`tracker_bridge`, extended)
-- Crypto: Arduino `Crypto` library by rweather (AES-128-CCM) on ESP; STC has no crypto (trusts gateway via local UART)
+- Crypto: Arduino `Crypto` library by rweather (AES-128-GCM) on ESP; STC has no crypto (trusts gateway via local UART)
 - Persistence: STC EEPROM (12 bytes existing config struct → extend to 14); ESP Preferences flash for counter state
 
 ---
@@ -25,7 +25,7 @@
 - `esphome/components/tracker_bridge/__init__.py` — extend hub schema with mesh config (channel, PSK, tracker_id, peer list)
 - `esphome/components/tracker_bridge/sensor.py` — extend to support per-remote-tracker sensor instantiation
 - `esphome/components/tracker_bridge/text_sensor.py` — same, plus `role` text sensor
-- `esphome/components/tracker_bridge/tracker_bridge.h` — major additions (ESP-NOW init, AES-CCM, message handlers, gateway election, config sync, command dispatch). Keep monolithic for v1 unless it crosses ~600 lines, in which case extract `tracker_mesh.h`.
+- `esphome/components/tracker_bridge/tracker_bridge.h` — major additions (ESP-NOW init, AES-GCM, message handlers, gateway election, config sync, command dispatch). Keep monolithic for v1 unless it crosses ~600 lines, in which case extract `tracker_mesh.h`.
 
 **ESP firmware (new files):**
 - `esphome/components/tracker_bridge/number.py` — new platform for RW config entities (wind storm/release/dwell/track thresh)
@@ -797,9 +797,9 @@ git commit -m "feat(stc): P4-6 -- !cfg get/set protocol with RO enforcement"
 
 ---
 
-## Task 7: ESP — ESP-NOW infrastructure with AES-128-CCM
+## Task 7: ESP — ESP-NOW infrastructure with AES-128-GCM
 
-**Goal:** Bring up ESP-NOW peering on the `tracker_bridge` component with AES-128-CCM auth and counter management. No application messages yet — just prove the wire layer.
+**Goal:** Bring up ESP-NOW peering on the `tracker_bridge` component with AES-128-GCM auth and counter management. No application messages yet — just prove the wire layer.
 
 **Files:**
 - Modify: `esphome/components/tracker_bridge/__init__.py` (schema additions)
@@ -857,7 +857,7 @@ In `tracker_bridge.h`, add at the top:
 #include <espnow.h>             // ESP-NOW C API for ESP8266
 #include <Crypto.h>
 #include <AES.h>
-#include <CCM.h>
+#include <GCM.h>
 #include "esphome/core/preferences.h"
 ```
 
@@ -867,7 +867,7 @@ Add to the class body (private section):
   /* --- Mesh config (set by YAML, read at setup) --- */
   uint8_t mesh_channel_{0};
   std::string mesh_psk_{};
-  uint8_t mesh_key_[16]{};      // derived from psk_ via SHA1 trunc (deterministic)
+  uint8_t mesh_key_[16]{};      // derived from psk_ via SHA-256 trunc (deterministic)
   std::string tracker_id_{};
   bool mesh_enabled_{false};
 
@@ -904,12 +904,12 @@ Implement `mesh_setup_`:
 
 ```cpp
   void mesh_setup_() {
-    /* Derive 16-byte AES key from PSK via SHA1 truncation
+    /* Derive 16-byte AES key from PSK via SHA-256 truncation
      * (deterministic, lets operators use a passphrase in YAML). */
-    SHA1 sha;
+    SHA256 sha;
     sha.update(mesh_psk_.data(), mesh_psk_.size());
-    uint8_t digest[20];
-    sha.finalize(digest, 20);
+    uint8_t digest[32];
+    sha.finalize(digest, 32);
     memcpy(mesh_key_, digest, 16);
 
     /* Restore TX counter from flash; advance by safety margin */
@@ -947,7 +947,7 @@ And outside the class (in the .h, at the bottom of the namespace):
 TrackerBridge *TrackerBridge::instance_ = nullptr;
 ```
 
-- [ ] **Step 4: AES-CCM frame send + receive helpers**
+- [ ] **Step 4: AES-GCM frame send + receive helpers**
 
 Add (still in tracker_bridge.h, after `mesh_setup_`):
 
@@ -973,23 +973,22 @@ Add (still in tracker_bridge.h, after `mesh_setup_`):
       global_preferences->sync();
     }
 
-    /* AES-CCM encrypt payload */
-    CCM<AES128> ccm;
-    ccm.setKey(mesh_key_, 16);
+    /* AES-GCM encrypt payload */
+    GCM<AES128> ccm;
+    gcm.setKey(mesh_key_, 16);
     /* Nonce: src(6) || ctr(4) || 0(2) = 12 bytes */
     uint8_t nonce[12];
     memcpy(nonce, mac, 6);
     memcpy(nonce + 6, pkt + 7, 4);
     nonce[10] = 0; nonce[11] = 0;
-    ccm.setIV(nonce, 12);
-    ccm.setTagSize(8);
+    gcm.setIV(nonce, 12);
     /* Additional authenticated data: type byte + header (so a tampered
      * type or counter is detected). */
-    ccm.addAuthData(pkt, 1 + 6 + 4);
+    gcm.addAuthData(pkt, 1 + 6 + 4);
     /* Encrypt payload into pkt at position 11; tag follows */
-    ccm.encrypt(pkt + 11, payload_in, plen);
+    gcm.encrypt(pkt + 11, payload_in, plen);
     uint8_t tag[8];
-    ccm.computeTag(tag, 8);
+    gcm.computeTag(tag, 8);
     memcpy(pkt + 11 + plen, tag, 8);
 
     /* Broadcast */
@@ -1015,19 +1014,18 @@ Add (still in tracker_bridge.h, after `mesh_setup_`):
       return;
     }
 
-    /* AES-CCM decrypt */
-    CCM<AES128> ccm;
-    ccm.setKey(mesh_key_, 16);
+    /* AES-GCM decrypt */
+    GCM<AES128> ccm;
+    gcm.setKey(mesh_key_, 16);
     uint8_t nonce[12];
     memcpy(nonce, src, 6);
     memcpy(nonce + 6, data + 7, 4);
     nonce[10] = 0; nonce[11] = 0;
-    ccm.setIV(nonce, 12);
-    ccm.setTagSize(8);
-    ccm.addAuthData(data, 1 + 6 + 4);
+    gcm.setIV(nonce, 12);
+    gcm.addAuthData(data, 1 + 6 + 4);
     uint8_t plaintext[64];
-    ccm.decrypt(plaintext, data + 11, plen);
-    if (!ccm.checkTag(data + 11 + plen, 8)) {
+    gcm.decrypt(plaintext, data + 11, plen);
+    if (!gcm.checkTag(data + 11 + plen, 8)) {
       ESP_LOGD(TAG, "AES auth fail src=%02X..%02X", src[0], src[5]);
       return;
     }
@@ -1070,7 +1068,7 @@ ota_password: "your-ota-password"
 wifi_ssid: "your-wifi-ssid"
 wifi_password: "your-wifi-password"
 fallback_password: "fallback-ap-password"
-# Phase 4: any string >= 16 chars; SHA1-derived 16-byte AES key.
+# Phase 4: any string >= 16 chars; SHA-256-derived 16-byte AES key.
 # Same on every tracker in the array.
 tracker_mesh_psk: "change-me-to-a-long-random-string"
 ```
@@ -1097,7 +1095,7 @@ git add esphome/components/tracker_bridge/__init__.py \
         esphome/components/tracker_bridge/tracker_bridge.h \
         EcoWorthyFirmware/esphome/solar-tracker-1.yaml \
         EcoWorthyFirmware/esphome/secrets.example.yaml
-git commit -m "feat(esp): P4-7 -- ESP-NOW infrastructure with AES-128-CCM"
+git commit -m "feat(esp): P4-7 -- ESP-NOW infrastructure with AES-128-GCM"
 ```
 
 ---
@@ -1939,7 +1937,7 @@ Update the design spec with any deviations discovered during the integration tes
 ... **Phases 0–4 are complete:** ...
 
 Phase 4 extends the Phase 3 bridge into a multi-tracker mesh: up to
-10 trackers share wind/storm state and config via AES-128-CCM
+10 trackers share wind/storm state and config via AES-128-GCM
 encrypted ESP-NOW broadcasts on a single WiFi channel. A statically-
 designated wind primary broadcasts wind every 5 s; secondaries with
 `wind_source: remote` use the broadcast value and failsafe-park if
@@ -1965,7 +1963,7 @@ identical firmware; behavior diverges by per-tracker `role` and
 `wind_source` settings (LCD Settings menu, EEPROM bytes 12-13) and
 runtime state (WiFi reachable -> gateway candidate via
 lowest-MAC election). The wind primary broadcasts wind every 5 s
-(AES-128-CCM authenticated with a per-array PSK); secondaries with
+(AES-128-GCM authenticated with a per-array PSK); secondaries with
 `wind_source: remote` consume the broadcast and failsafe to storm-
 park if broadcasts stop for ~20 s. HA commands and config get/set
 flow through the acting gateway as `\xAA\x55`-framed `!` commands
@@ -1993,7 +1991,7 @@ git push origin phase-4-complete
 
 **Spec coverage check** (going section-by-section through `docs/superpowers/specs/2026-05-20-phase-4-mesh-design.md`):
 
-- Locked design decisions (table of 8): all reflected. Scale (T1-T11), WiFi reality (T7-T9), gateway topology (T9), dedup (T9 lowest-MAC), failsafe (T5), command surface (T4 + T10), security (T7 AES-CCM), config get/set (T6 STC, T10/T11 ESP).
+- Locked design decisions (table of 8): all reflected. Scale (T1-T11), WiFi reality (T7-T9), gateway topology (T9), dedup (T9 lowest-MAC), failsafe (T5), command surface (T4 + T10), security (T7 AES-GCM), config get/set (T6 STC, T10/T11 ESP).
 - Three orthogonal roles: wind primary (T2 Settings, T8 broadcast), acting gateway (T9 election), remote (default).
 - Wire protocol: frame format (T7), message types WIND/TELEMETRY/GATEWAY_HB/COMMAND/CONFIG (T8/T9/T10), command codes (T10), CONFIG protocol (T6/T10/T11), counter management (T7), channel handling (T7 + secrets example).
 - STC firmware additions: new EEPROM bytes (T1), Settings entries (T2), storm logic extension (T5), command parser (T3/T4/T6), safety bounds (T4).
