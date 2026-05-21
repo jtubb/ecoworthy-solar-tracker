@@ -242,13 +242,18 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   static constexpr uint8_t MSG_COMMAND    = 4;
   static constexpr uint8_t MSG_CONFIG     = 5;
 
+  /* Role constants: primary owns the wind sensor and broadcasts WIND packets;
+   * secondary nodes receive WIND from the primary and forward to their STC. */
+  static constexpr uint8_t ROLE_PRIMARY   = 1;
+  static constexpr uint8_t ROLE_SECONDARY = 2;
+
   /* --- Cached STC state, populated by handle_payload_ --- */
   uint8_t local_az_pct_{0};
   uint8_t local_el_pct_{0};
   uint8_t local_wind_used_{0};
   std::string local_mode_{};
-  /* 1=primary (owns wind sensor + broadcasts WIND), 2=secondary */
-  uint8_t local_role_{2};
+  /* ROLE_PRIMARY or ROLE_SECONDARY (default secondary until set via YAML) */
+  uint8_t local_role_{ROLE_SECONDARY};
 
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
@@ -310,7 +315,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* Every 5 s: TELEMETRY (always), WIND (if primary), GATEWAY_HB (if WiFi up) */
     this->set_interval("mesh_broadcasts", 5000, [this]() {
       this->mesh_tx_telemetry_();
-      if (this->local_role_ == 1) this->mesh_tx_wind_();
+      if (this->local_role_ == ROLE_PRIMARY) this->mesh_tx_wind_();
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
     });
   }
@@ -451,6 +456,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     switch (type) {
       case MSG_WIND:
         if (plen < 2) return;
+        /* The primary is the sender of WIND broadcasts.  ESP-NOW broadcasts
+         * loop back to the sender on ESP8266 ROLE_COMBO, so the primary
+         * receives its own packet -- skip the forward to avoid a redundant
+         * !wind= command to the primary's own STC. */
+        if (local_role_ == ROLE_PRIMARY) break;
         /* Forward wind value to local STC via the !wind=NN framed command.
          * Secondary nodes relay primary's wind reading to their STC so the
          * STC's own storm_check can trip without a local wind sensor. */
@@ -506,7 +516,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (m == "nocal")  return 7;
     if (m == "btest")  return 8;
     if (m == "ver")    return 9;
-    return 255;
+    return 255;  /* 255 = unknown mode sentinel (STC sent '?' or a new mode we don't know) */
   }
 
   /* ---- send_command_frame_: build and write a !cmd=NN framed UART packet ----
@@ -515,8 +525,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * uart_send_frame / crc8_update (see EcoWorthyFirmware/src/main.c). */
   void send_command_frame_(const char *prefix, uint8_t value) {
     char buf[16];
-    snprintf(buf, sizeof(buf), "%s%u", prefix, (unsigned)value);
-    size_t len = strlen(buf);
+    int sn = snprintf(buf, sizeof(buf), "%s%u", prefix, (unsigned)value);
+    /* sn == 0 is an empty payload (shouldn't happen); sn >= sizeof(buf) means
+     * snprintf would have written more than fits -- truncation occurred and the
+     * buffer contains a garbage-truncated string.  Bail in either case. */
+    if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+      ESP_LOGE(TAG, "send_command_frame_ snprintf truncation (sn=%d)", sn);
+      return;
+    }
+    size_t len = (size_t)sn;
     uint8_t crc = 0;
     for (size_t i = 0; i < len; i++)
       crc = crc8_step_(crc, (uint8_t)buf[i]);
