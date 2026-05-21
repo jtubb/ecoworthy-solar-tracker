@@ -102,6 +102,12 @@ async def to_code(config):
         # the device log as "registered peer 'ZZZ-CODEGEN-TEST'" / setup()
         # peer_decls_ size>=1, then the entire to_code path is broken.
         cg.add(var.register_peer("ZZZ-CODEGEN-TEST"))
+        # DEBUG: encode codegen-time peer count + first peer name into a fake
+        # register_peer call so the runtime log surfaces what to_code saw.
+        # Reveals whether the YAML ESPHome is actually compiling has peers:
+        # at all, and what the schema returned for it.
+        first_peer = peers[0] if peers else "NONE"
+        cg.add(var.register_peer(f"DEBUG-COUNT-{len(peers)}-FIRST-{first_peer}"))
         for peer_name in peers:
             print(f"[tracker_bridge.__init__]   emitting register_peer({peer_name!r})")
             cg.add(var.register_peer(peer_name))
