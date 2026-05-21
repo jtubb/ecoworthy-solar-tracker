@@ -21,7 +21,6 @@ from esphome.const import CONF_ID
 CODEOWNERS = ["@jtubb"]
 DEPENDENCIES = ["uart"]
 MULTI_CONF = True
-LIBRARIES = ["rweather/Crypto@^0.4.0"]  # AES-CCM on ESP8266
 
 tracker_bridge_ns = cg.esphome_ns.namespace("tracker_bridge")
 TrackerBridge = tracker_bridge_ns.class_(
@@ -60,6 +59,10 @@ async def to_code(config):
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
     if CONF_MESH in config:
+        # AES-128-CCM + SHA1 for the mesh.  rweather/Crypto exposes
+        # <AES.h>, <CCM.h>, <SHA1.h>.  ESPHome wires this through to
+        # PlatformIO's lib_deps for the build.
+        cg.add_library("rweather/Crypto", "^0.4.0")
         mesh = config[CONF_MESH]
         cg.add(var.set_mesh_channel(mesh[CONF_CHANNEL]))
         cg.add(var.set_mesh_psk(mesh[CONF_PSK]))
