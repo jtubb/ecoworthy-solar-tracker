@@ -121,7 +121,9 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     auto key = make_name_key_(name);
     /* Just ensure the slot exists; sensors are attached later by set_*_for(). */
     peer_decls_[key];  // default-constructs PeerDecl if not present
-    ESP_LOGD(TAG, "registered peer '%s'", name.c_str());
+    char hex[33] = {};
+    for (int i = 0; i < 16; i++) sprintf(hex + i * 2, "%02X", (uint8_t) key[i]);
+    ESP_LOGI(TAG, "registered peer '%s' key[0..15]=%s", name.c_str(), hex);
   }
 
   /* --- Config slider write path: local STC or remote peer via mesh --- */
@@ -886,6 +888,16 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (it == peer_decls_.end()) {
       ESP_LOGW(TAG, "[gateway] unknown peer node_name '%.32s' -- not in peer_decls_",
                name_key.data());
+      /* Diagnostic: dump first 16 bytes of inbound key + each registered key
+       * so we can see exactly where they diverge. */
+      char hex_in[33] = {};
+      for (int i = 0; i < 16; i++) sprintf(hex_in + i * 2, "%02X", (uint8_t) name_key[i]);
+      ESP_LOGW(TAG, "  inbound  key[0..15]=%s", hex_in);
+      for (const auto &kv : peer_decls_) {
+        char hex_reg[33] = {};
+        for (int i = 0; i < 16; i++) sprintf(hex_reg + i * 2, "%02X", (uint8_t) kv.first[i]);
+        ESP_LOGW(TAG, "  declared key[0..15]=%s", hex_reg);
+      }
       return;
     }
     auto &d = it->second;
