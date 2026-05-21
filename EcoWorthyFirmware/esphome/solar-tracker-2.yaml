@@ -88,7 +88,10 @@ tracker_bridge:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
     tracker_id: "T2"
-    local_role: secondary  # receives WIND from primary; no local wind sensor
+    local_role: primary    # bench test: synthetic primary, broadcasts WIND from wind_override slider
+    peers:
+      - mac: "EC:FA:BC:A9:0D:BD"   # tracker-1 (real STC node)
+        id: "T1"
 
 stream_server:
   uart_id: uart_bus
@@ -107,6 +110,15 @@ sensor:
       name: "$friendly_name Elevation %"
     wind:
       name: "$friendly_name Wind"
+  # Mirror of T1 (the real STC node) -- populated when this tracker is
+  # the acting gateway.  Lets HA see T1's data even if tracker-1's API
+  # is briefly unreachable while this one is up.
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: T1
+    az:   { name: "T1 Azimuth %" }
+    el:   { name: "T1 Elevation %" }
+    wind: { name: "T1 Wind" }
 
 text_sensor:
   - platform: wifi_info
@@ -118,11 +130,23 @@ text_sensor:
     tracker_bridge_id: bridge
     mode:
       name: "$friendly_name Mode"
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: T1
+    mode: { name: "T1 Mode" }
 
 binary_sensor:
   - platform: stream_server
     connected:
       name: "$friendly_name Stream Server Client Connected"
+
+# --- Bench helper: HA-controllable wind value for the mesh broadcast.
+#     Only meaningful on this no-STC node; remove on real installs.
+number:
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    wind_override:
+      name: "$friendly_name Wind override"
 
 # --- Debug: runtime baud-rate select (leave at 9600 unless debugging) --
 select:
