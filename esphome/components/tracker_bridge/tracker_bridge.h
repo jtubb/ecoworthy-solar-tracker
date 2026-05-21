@@ -254,9 +254,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     memcpy(mesh_key_, digest, 16);
 
     /* Restore TX counter from flash; advance by a safety margin to
-     * guarantee monotonicity across power cycles. */
-    pref_tx_counter_ = global_preferences->make_preference<uint32_t>(
-        this->get_object_id_hash() ^ 0xC0DEC0DE);
+     * guarantee monotonicity across power cycles.  Fixed preference
+     * key -- there's one tracker_bridge per device in practice
+     * (MULTI_CONF + the singleton already preclude two instances). */
+    pref_tx_counter_ = global_preferences->make_preference<uint32_t>(0xC0DEC0DE);
     if (!pref_tx_counter_.load(&tx_counter_)) tx_counter_ = 0;
     tx_counter_ += CTR_FLUSH_EVERY;
     pref_tx_counter_.save(&tx_counter_);
@@ -287,7 +288,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * lambda cannot carry that attribute and would be placed in flash,
    * risking a cache-stall panic.  This thin stub lives in IRAM and
    * dispatches to mesh_rx_() which may remain in flash. */
-  static void ICACHE_RAM_ATTR recv_cb_(uint8_t *mac, uint8_t *data, uint8_t len) {
+  static void IRAM_ATTR recv_cb_(uint8_t *mac, uint8_t *data, uint8_t len) {
     if (TrackerBridge::instance_)
       TrackerBridge::instance_->mesh_rx_(mac, data, len);
   }
@@ -341,8 +342,9 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     nonce[10] = 0;
     nonce[11] = 0;
     gcm.setIV(nonce, 12);
-    gcm.setTagSize(8);
-    /* AAD: type byte + src MAC + counter */
+    /* AAD: type byte + src MAC + counter.  Tag size is fixed at 8 via
+     * the computeTag/checkTag length argument; GCM has no separate
+     * setTagSize() in this library. */
     gcm.addAuthData(pkt, 1 + 6 + 4);
     /* Encrypt payload into pkt at byte 11; tag follows at pkt[11+plen] */
     gcm.encrypt(pkt + 11, payload_in, plen);
@@ -388,7 +390,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     nonce[10] = 0;
     nonce[11] = 0;
     gcm.setIV(nonce, 12);
-    gcm.setTagSize(8);
     gcm.addAuthData(data, 1 + 6 + 4);
     uint8_t plaintext[64];
     if (plen > sizeof(plaintext)) {
