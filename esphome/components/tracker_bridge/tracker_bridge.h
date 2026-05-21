@@ -494,8 +494,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       mode_to_code_(local_mode_)
     };
     mesh_tx_(MSG_TELEMETRY, p, 4);
-    ESP_LOGD(TAG, "tx TELEMETRY az=%u el=%u wind=%u mode=%u",
-             p[0], p[1], p[2], p[3]);
+    ESP_LOGD(TAG, "tx TELEMETRY az=%u el=%u wind=%u mode=%u role=%u",
+             p[0], p[1], p[2], p[3], (unsigned) local_role_);
   }
 
   void mesh_tx_wind_() {
