@@ -93,5 +93,11 @@ async def to_code(config):
         cg.add(var.set_local_role(1 if mesh[CONF_LOCAL_ROLE] == "primary" else 2))
         # Register declared peers before sensor/text_sensor/number platforms run
         # (this to_code executes first; platforms attach afterwards).
-        for peer_name in mesh.get(CONF_PEERS, []):
+        peers = mesh.get(CONF_PEERS, [])
+        # DEBUG: surface what schema gave us at compile time -- to_code can't
+        # log to the device, but print() lands in `esphome compile` stdout.
+        print(f"[tracker_bridge.__init__] CONF_MESH keys: {list(mesh.keys())}")
+        print(f"[tracker_bridge.__init__] CONF_PEERS value: {peers!r}")
+        for peer_name in peers:
+            print(f"[tracker_bridge.__init__]   emitting register_peer({peer_name!r})")
             cg.add(var.register_peer(peer_name))
