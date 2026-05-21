@@ -87,6 +87,7 @@ tracker_bridge:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
     tracker_id: "T1"
+    local_role: primary    # owns the wind sensor; broadcasts WIND frames
 
 stream_server:
   uart_id: uart_bus

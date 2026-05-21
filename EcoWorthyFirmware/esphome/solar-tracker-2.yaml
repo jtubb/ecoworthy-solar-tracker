@@ -88,6 +88,7 @@ tracker_bridge:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
     tracker_id: "T2"
+    local_role: secondary  # receives WIND from primary; no local wind sensor
 
 stream_server:
   uart_id: uart_bus

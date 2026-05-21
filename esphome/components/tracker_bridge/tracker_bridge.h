@@ -67,6 +67,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   void set_mesh_psk(const std::string &psk) { mesh_psk_ = psk; }
   void set_tracker_id(const std::string &id) { tracker_id_ = id; }
   void set_test_broadcast(bool v) { test_broadcast_ = v; }
+  /* local_role: 1 = primary (owns wind sensor), 2 = secondary */
+  void set_local_role(uint8_t r) { local_role_ = r; }
 
   void setup() override {
     /* Poll the STC every 2 s.  ESPHome's set_interval handles timing
@@ -216,6 +218,12 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (el_   && el   >= 0) el_->publish_state(float(el));
     if (wind_ && wind >= 0) wind_->publish_state(float(wind));
     if (mode_ && !mode.empty()) mode_->publish_state(mode);
+
+    /* Cache for mesh broadcasts (Task 8). */
+    if (az   >= 0) local_az_pct_   = (uint8_t)(az   > 255 ? 255 : az);
+    if (el   >= 0) local_el_pct_   = (uint8_t)(el   > 255 ? 255 : el);
+    if (wind >= 0) local_wind_used_ = (uint8_t)(wind > 255 ? 255 : wind);
+    if (!mode.empty()) local_mode_ = mode;
   }
 
   sensor::Sensor *az_{nullptr};
@@ -226,6 +234,21 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   /* ================================================================
    * Phase 4: ESP-NOW mesh -- AES-128-GCM authenticated broadcast
    * ================================================================ */
+
+  /* --- Message types (Phase 4 Task 8) --- */
+  static constexpr uint8_t MSG_WIND       = 1;
+  static constexpr uint8_t MSG_TELEMETRY  = 2;
+  static constexpr uint8_t MSG_GATEWAY_HB = 3;
+  static constexpr uint8_t MSG_COMMAND    = 4;
+  static constexpr uint8_t MSG_CONFIG     = 5;
+
+  /* --- Cached STC state, populated by handle_payload_ --- */
+  uint8_t local_az_pct_{0};
+  uint8_t local_el_pct_{0};
+  uint8_t local_wind_used_{0};
+  std::string local_mode_{};
+  /* 1=primary (owns wind sensor + broadcasts WIND), 2=secondary */
+  uint8_t local_role_{2};
 
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
@@ -281,8 +304,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* Register broadcast peer (FF:FF:FF:FF:FF:FF). */
     uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_now_add_peer(bcast, ESP_NOW_ROLE_SLAVE, mesh_channel_, NULL, 0);
-    ESP_LOGI(TAG, "Mesh enabled: channel=%u tracker_id=%s",
-             mesh_channel_, tracker_id_.c_str());
+    ESP_LOGI(TAG, "Mesh enabled: channel=%u tracker_id=%s role=%u",
+             mesh_channel_, tracker_id_.c_str(), (unsigned)local_role_);
+
+    /* Every 5 s: TELEMETRY (always), WIND (if primary), GATEWAY_HB (if WiFi up) */
+    this->set_interval("mesh_broadcasts", 5000, [this]() {
+      this->mesh_tx_telemetry_();
+      if (this->local_role_ == 1) this->mesh_tx_wind_();
+      if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
+    });
   }
 
   /* ---- recv_cb_: IRAM-resident ESP-NOW receive callback entry point ----
@@ -411,14 +441,93 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     mesh_dispatch_(type, src, plaintext, plen);
   }
 
-  /* ---- mesh_dispatch_: stub for Phase 4 Tasks 8-12 ---- */
+  /* ---- mesh_dispatch_: route inbound frames (Task 8+) ---- */
   void mesh_dispatch_(uint8_t type, uint8_t src[6],
                       const uint8_t *p, size_t plen) {
-    /* Future tasks will route on `type`.  For now, log receipt. */
     ESP_LOGI(TAG, "mesh rx type=%u from %02X:%02X:%02X:%02X:%02X:%02X plen=%u",
              type,
              src[0], src[1], src[2], src[3], src[4], src[5],
              (unsigned)plen);
+    switch (type) {
+      case MSG_WIND:
+        if (plen < 2) return;
+        /* Forward wind value to local STC via the !wind=NN framed command.
+         * Secondary nodes relay primary's wind reading to their STC so the
+         * STC's own storm_check can trip without a local wind sensor. */
+        send_command_frame_("!wind=", p[0]);
+        break;
+      case MSG_TELEMETRY:
+      case MSG_GATEWAY_HB:
+        /* Handled in Tasks 9 + 10. */
+        break;
+      default:
+        /* type=99 is the bench test type; others are future. */
+        break;
+    }
+  }
+
+  /* ---- Periodic mesh broadcast helpers (Task 8) ---- */
+
+  void mesh_tx_telemetry_() {
+    uint8_t p[4] = {
+      local_az_pct_, local_el_pct_, local_wind_used_,
+      mode_to_code_(local_mode_)
+    };
+    mesh_tx_(MSG_TELEMETRY, p, 4);
+    ESP_LOGD(TAG, "tx TELEMETRY az=%u el=%u wind=%u mode=%u",
+             p[0], p[1], p[2], p[3]);
+  }
+
+  void mesh_tx_wind_() {
+    uint8_t p[2] = { local_wind_used_, 0 };
+    /* Flag bit 0: storm active on primary */
+    if (local_mode_ == "storm") p[1] |= 0x01;
+    mesh_tx_(MSG_WIND, p, 2);
+    ESP_LOGD(TAG, "tx WIND wind=%u flags=0x%02X", p[0], p[1]);
+  }
+
+  void mesh_tx_gateway_hb_() {
+    int8_t rssi = (int8_t)WiFi.RSSI();
+    uint8_t p[1] = { (uint8_t)rssi };
+    mesh_tx_(MSG_GATEWAY_HB, p, 1);
+    ESP_LOGD(TAG, "tx GATEWAY_HB rssi=%d", (int)rssi);
+  }
+
+  /* Map STC mode string (from uart_mode_str in main.c) to a compact code.
+   * Strings are the authority -- pulled directly from STC firmware. */
+  static uint8_t mode_to_code_(const std::string &m) {
+    if (m == "idle")   return 0;
+    if (m == "track")  return 1;
+    if (m == "storm")  return 2;
+    if (m == "jog")    return 3;
+    if (m == "cal")    return 4;
+    if (m == "menu")   return 5;
+    if (m == "set")    return 6;   /* ST_SETTINGS / ST_SETTINGS_EDIT */
+    if (m == "nocal")  return 7;
+    if (m == "btest")  return 8;
+    if (m == "ver")    return 9;
+    return 255;
+  }
+
+  /* ---- send_command_frame_: build and write a !cmd=NN framed UART packet ----
+   * Format: AA 55 <ASCII cmd string> <2 hex CRC8> LF
+   * CRC covers only the ASCII payload bytes -- byte-identical to the STC's
+   * uart_send_frame / crc8_update (see EcoWorthyFirmware/src/main.c). */
+  void send_command_frame_(const char *prefix, uint8_t value) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%s%u", prefix, (unsigned)value);
+    size_t len = strlen(buf);
+    uint8_t crc = 0;
+    for (size_t i = 0; i < len; i++)
+      crc = crc8_step_(crc, (uint8_t)buf[i]);
+    this->write_byte(0xAA);
+    this->write_byte(0x55);
+    for (size_t i = 0; i < len; i++)
+      this->write_byte((uint8_t)buf[i]);
+    this->write_byte((uint8_t)hex_digit_(crc >> 4));
+    this->write_byte((uint8_t)hex_digit_(crc & 0x0F));
+    this->write_byte(uint8_t('\n'));
+    ESP_LOGD(TAG, "cmd->STC: %s (crc=%02X)", buf, crc);
   }
 };
 

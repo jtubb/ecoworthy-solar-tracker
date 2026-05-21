@@ -35,6 +35,7 @@ CONF_CHANNEL = "channel"
 CONF_PSK = "psk"
 CONF_TRACKER_ID = "tracker_id"
 CONF_TEST_BROADCAST = "test_broadcast"
+CONF_LOCAL_ROLE = "local_role"
 
 CONFIG_SCHEMA = (
     cv.Schema({
@@ -47,6 +48,11 @@ CONFIG_SCHEMA = (
             # after boot. Pair with a listener node; expect a log line
             # `rx type=99 from XX..XX plen=2`.  Leave unset in production.
             cv.Optional(CONF_TEST_BROADCAST, default=False): cv.boolean,
+            # Role in the mesh: "primary" owns the wind sensor and broadcasts
+            # WIND frames; "secondary" receives them and forwards to its STC.
+            # Set per-device in YAML; defaults to "secondary" if unset.
+            cv.Optional(CONF_LOCAL_ROLE, default="secondary"):
+                cv.one_of("primary", "secondary", lower=True),
         }),
     })
     .extend(cv.COMPONENT_SCHEMA)
@@ -68,3 +74,4 @@ async def to_code(config):
         cg.add(var.set_mesh_psk(mesh[CONF_PSK]))
         cg.add(var.set_tracker_id(mesh[CONF_TRACKER_ID]))
         cg.add(var.set_test_broadcast(mesh[CONF_TEST_BROADCAST]))
+        cg.add(var.set_local_role(1 if mesh[CONF_LOCAL_ROLE] == "primary" else 2))
