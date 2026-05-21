@@ -87,11 +87,9 @@ tracker_bridge:
   mesh:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
-    tracker_id: "T2"
     local_role: primary    # bench test: synthetic primary, broadcasts WIND from wind_override slider
     peers:
-      - mac: "EC:FA:BC:A9:0D:BD"   # tracker-1 (real STC node)
-        id: "T1"
+      - solar-tracker-1   # node_name of the peer (esphome.name in that node's YAML)
 
 stream_server:
   uart_id: uart_bus
@@ -110,15 +108,15 @@ sensor:
       name: "$friendly_name Elevation %"
     wind:
       name: "$friendly_name Wind"
-  # Mirror of T1 (the real STC node) -- populated when this tracker is
-  # the acting gateway.  Lets HA see T1's data even if tracker-1's API
+  # Mirror of solar-tracker-1 (the real STC node) -- populated when this
+  # tracker is the acting gateway.  Lets HA see T1's data even if T1's API
   # is briefly unreachable while this one is up.
   - platform: tracker_bridge
     tracker_bridge_id: bridge
-    peer_id: T1
-    az:   { name: "T1 Azimuth %" }
-    el:   { name: "T1 Elevation %" }
-    wind: { name: "T1 Wind" }
+    peer_id: solar-tracker-1
+    az:   { name: "Solar Tracker 1 Azimuth %" }
+    el:   { name: "Solar Tracker 1 Elevation %" }
+    wind: { name: "Solar Tracker 1 Wind" }
 
 text_sensor:
   - platform: wifi_info
@@ -132,8 +130,8 @@ text_sensor:
       name: "$friendly_name Mode"
   - platform: tracker_bridge
     tracker_bridge_id: bridge
-    peer_id: T1
-    mode: { name: "T1 Mode" }
+    peer_id: solar-tracker-1
+    mode: { name: "Solar Tracker 1 Mode" }
 
 binary_sensor:
   - platform: stream_server

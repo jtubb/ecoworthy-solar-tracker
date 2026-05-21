@@ -86,11 +86,9 @@ tracker_bridge:
   mesh:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
-    tracker_id: "T1"
     local_role: secondary  # bench test: receives WIND from synthetic primary on tracker-2
     peers:
-      - mac: "84:F3:EB:03:FB:B2"   # Tracker-2 station MAC (verified from logs)
-        id: "T2"
+      - solar-tracker-2   # node_name of the peer (esphome.name in that node's YAML)
 
 stream_server:
   uart_id: uart_bus
@@ -110,10 +108,10 @@ sensor:
       name: "$friendly_name Elevation %"
     wind:
       name: "$friendly_name Wind"
-  # T2 peer status sensors (published by gateway when T2 TELEMETRY is received)
+  # solar-tracker-2 peer status sensors (published by gateway when its TELEMETRY is received)
   - platform: tracker_bridge
     tracker_bridge_id: bridge
-    peer_id: "T2"
+    peer_id: "solar-tracker-2"
     az:
       name: "Solar Tracker 2 Azimuth %"
     el:
@@ -132,10 +130,10 @@ text_sensor:
     tracker_bridge_id: bridge
     mode:
       name: "$friendly_name Mode"
-  # T2 peer mode (published by gateway when T2 TELEMETRY is received)
+  # solar-tracker-2 peer mode (published by gateway when its TELEMETRY is received)
   - platform: tracker_bridge
     tracker_bridge_id: bridge
-    peer_id: "T2"
+    peer_id: "solar-tracker-2"
     mode:
       name: "Solar Tracker 2 Mode"
 
@@ -177,10 +175,10 @@ number:
       min_value: 1
       max_value: 99
       step: 1
-  # T2 peer config.  Moving a slider broadcasts CONFIG SET_REQ over mesh.
+  # solar-tracker-2 peer config.  Moving a slider broadcasts CONFIG SET_REQ over mesh.
   - platform: tracker_bridge
     tracker_bridge_id: bridge
-    peer_id: "T2"
+    peer_id: "solar-tracker-2"
     wind_storm_mps:
       name: "Solar Tracker 2 Wind Storm"
       min_value: 5

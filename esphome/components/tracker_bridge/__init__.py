@@ -33,19 +33,23 @@ CONF_TRACKER_BRIDGE_ID = "tracker_bridge_id"
 CONF_MESH = "mesh"
 CONF_CHANNEL = "channel"
 CONF_PSK = "psk"
-CONF_TRACKER_ID = "tracker_id"
 CONF_TEST_BROADCAST = "test_broadcast"
 CONF_LOCAL_ROLE = "local_role"
 
-# --- Phase 4 Task 11: peer list ---
+# --- Phase 4 P4-12: peer list (name-only, no MAC) ---
 CONF_PEERS = "peers"
-CONF_MAC = "mac"
-CONF_ID_LABEL = "id"
 
-PEER_SCHEMA = cv.Schema({
-    cv.Required(CONF_MAC): cv.mac_address,
-    cv.Required(CONF_ID_LABEL): cv.string_strict,
-})
+
+def _validate_peer_name(value):
+    """Validate peer name string; warn if > 31 chars (will be truncated at runtime)."""
+    value = cv.string_strict(value)
+    if len(value) > 31:
+        raise cv.Invalid(
+            f"Peer name '{value}' is {len(value)} chars; maximum is 31 "
+            f"(will be truncated to fit the 32-byte node_name field)"
+        )
+    return value
+
 
 CONFIG_SCHEMA = (
     cv.Schema({
@@ -53,7 +57,6 @@ CONFIG_SCHEMA = (
         cv.Optional(CONF_MESH): cv.Schema({
             cv.Required(CONF_CHANNEL): cv.int_range(min=1, max=13),
             cv.Required(CONF_PSK): cv.string,   # 16-byte hex or passphrase
-            cv.Required(CONF_TRACKER_ID): cv.string_strict,
             # Bench validation: when true, emit a 2-byte test packet 3 s
             # after boot. Pair with a listener node; expect a log line
             # `rx type=99 from XX..XX plen=2`.  Leave unset in production.
@@ -63,10 +66,10 @@ CONFIG_SCHEMA = (
             # Set per-device in YAML; defaults to "secondary" if unset.
             cv.Optional(CONF_LOCAL_ROLE, default="secondary"):
                 cv.one_of("primary", "secondary", lower=True),
-            # Declared peer trackers: each entry maps a station MAC to a
-            # short id_label used by sensor/text_sensor/number platforms to
-            # attach their entities to the right peer slot.
-            cv.Optional(CONF_PEERS, default=[]): cv.ensure_list(PEER_SCHEMA),
+            # Declared peer trackers: list of esphome.name strings.
+            # Binding key is the node_name (from App.get_name()), NOT MAC.
+            # Each entry must match the 'name:' field in the peer's YAML.
+            cv.Optional(CONF_PEERS, default=[]): cv.ensure_list(_validate_peer_name),
         }),
     })
     .extend(cv.COMPONENT_SCHEMA)
@@ -79,22 +82,16 @@ async def to_code(config):
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
     if CONF_MESH in config:
-        # AES-128-CCM + SHA1 for the mesh.  rweather/Crypto exposes
-        # <AES.h>, <CCM.h>, <SHA1.h>.  ESPHome wires this through to
+        # AES-128-GCM + SHA256 for the mesh.  rweather/Crypto exposes
+        # <AES.h>, <GCM.h>, <SHA256.h>.  ESPHome wires this through to
         # PlatformIO's lib_deps for the build.
         cg.add_library("rweather/Crypto", "^0.4.0")
         mesh = config[CONF_MESH]
         cg.add(var.set_mesh_channel(mesh[CONF_CHANNEL]))
         cg.add(var.set_mesh_psk(mesh[CONF_PSK]))
-        cg.add(var.set_tracker_id(mesh[CONF_TRACKER_ID]))
         cg.add(var.set_test_broadcast(mesh[CONF_TEST_BROADCAST]))
         cg.add(var.set_local_role(1 if mesh[CONF_LOCAL_ROLE] == "primary" else 2))
         # Register declared peers before sensor/text_sensor/number platforms run
         # (this to_code executes first; platforms attach afterwards).
-        for peer in mesh.get(CONF_PEERS, []):
-            mac = peer[CONF_MAC].parts   # tuple of 6 ints
-            cg.add(var.register_peer(
-                mac[0], mac[1], mac[2],
-                mac[3], mac[4], mac[5],
-                peer[CONF_ID_LABEL],
-            ))
+        for peer_name in mesh.get(CONF_PEERS, []):
+            cg.add(var.register_peer(peer_name))

@@ -25,6 +25,18 @@
  * Set `mesh: test_broadcast: true` in YAML to emit a 2-byte test
  * packet 3 s after boot (for bench validation with a listener node);
  * leave unset / false in production.
+ *
+ * P4-12: frame header grows from 11 to 45 bytes.  Layout:
+ *   [0]      type       (1 byte)
+ *   [1..6]   src MAC    (6 bytes)
+ *   [7..8]   epoch      (2 bytes, big-endian, boot counter)
+ *   [9..12]  ctr        (4 bytes, big-endian, per-boot frame counter)
+ *   [13..44] node_name  (32 bytes, NUL-padded ASCII, from App.get_name())
+ *   [45..]   ciphertext (plen bytes, AES-128-GCM)
+ *   [..+8]   AES-GCM tag (8 bytes)
+ * AAD covers all 45 header bytes.
+ * Nonce: src(6) || epoch(2) || ctr(4) = 12 bytes.
+ * Binding key for replay + peer lookup: node_name (32 bytes).
  */
 
 #include "esphome/core/component.h"
@@ -33,6 +45,7 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/preferences.h"
+#include "esphome/core/application.h"
 
 #ifdef USE_NUMBER
 #include "esphome/components/number/number.h"
@@ -76,41 +89,39 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   /* --- Per-peer entity setters: empty peer_id → local, else route to peer_decls_ --- */
   void set_az_sensor_for(const std::string &peer_id, sensor::Sensor *s) {
     if (peer_id.empty()) { az_ = s; return; }
-    for (auto &kv : peer_decls_) {
-      if (kv.second.id_label == peer_id) { kv.second.az = s; return; }
-    }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.az = s; return; }
     ESP_LOGW(TAG, "set_az_sensor_for: unknown peer_id '%s'", peer_id.c_str());
   }
   void set_el_sensor_for(const std::string &peer_id, sensor::Sensor *s) {
     if (peer_id.empty()) { el_ = s; return; }
-    for (auto &kv : peer_decls_) {
-      if (kv.second.id_label == peer_id) { kv.second.el = s; return; }
-    }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.el = s; return; }
     ESP_LOGW(TAG, "set_el_sensor_for: unknown peer_id '%s'", peer_id.c_str());
   }
   void set_wind_sensor_for(const std::string &peer_id, sensor::Sensor *s) {
     if (peer_id.empty()) { wind_ = s; return; }
-    for (auto &kv : peer_decls_) {
-      if (kv.second.id_label == peer_id) { kv.second.wind = s; return; }
-    }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.wind = s; return; }
     ESP_LOGW(TAG, "set_wind_sensor_for: unknown peer_id '%s'", peer_id.c_str());
   }
   void set_mode_sensor_for(const std::string &peer_id, text_sensor::TextSensor *s) {
     if (peer_id.empty()) { mode_ = s; return; }
-    for (auto &kv : peer_decls_) {
-      if (kv.second.id_label == peer_id) { kv.second.mode = s; return; }
-    }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.mode = s; return; }
     ESP_LOGW(TAG, "set_mode_sensor_for: unknown peer_id '%s'", peer_id.c_str());
   }
 
   /* --- Peer registration (called from __init__.py to_code for each declared peer) --- */
-  void register_peer(uint8_t a, uint8_t b, uint8_t c,
-                     uint8_t d, uint8_t e, uint8_t f,
-                     const std::string &id) {
-    std::array<uint8_t, 6> mac{a, b, c, d, e, f};
-    peer_decls_[mac].id_label = id;
-    ESP_LOGD(TAG, "registered peer '%s' %02X:%02X:%02X:%02X:%02X:%02X",
-             id.c_str(), a, b, c, d, e, f);
+  void register_peer(const std::string &name) {
+    auto key = make_name_key_(name);
+    /* Just ensure the slot exists; sensors are attached later by set_*_for(). */
+    peer_decls_[key];  // default-constructs PeerDecl if not present
+    ESP_LOGD(TAG, "registered peer '%s'", name.c_str());
   }
 
   /* --- Config slider write path: local STC or remote peer via mesh --- */
@@ -125,13 +136,9 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       }
       write_str_frame_(buf);
     } else {
-      /* Remote peer: broadcast CONFIG SET_REQ over mesh */
-      const uint8_t *target = find_peer_mac_(peer_id);
-      if (!target) {
-        ESP_LOGW(TAG, "config_set_for_peer: unknown peer_id '%s'", peer_id.c_str());
-        return;
-      }
-      (void)target;  /* target MAC reserved for unicast targeting in Task 12 */
+      /* Remote peer: broadcast CONFIG SET_REQ over mesh.
+       * MSG_COMMAND still uses MAC for unicast targeting, so we look up the
+       * peer's last-seen MAC.  CONFIG is broadcast for now (v1 all-accept). */
       uint8_t p[3] = { CFG_OP_SET_REQ, field_id, value };
       mesh_tx_(MSG_CONFIG, p, 3);
       ESP_LOGD(TAG, "config_set peer='%s' fid=%u val=%u", peer_id.c_str(), field_id, value);
@@ -141,7 +148,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   /* --- Phase 4: mesh config setters (called from __init__.py to_code) --- */
   void set_mesh_channel(uint8_t ch) { mesh_channel_ = ch; mesh_enabled_ = true; }
   void set_mesh_psk(const std::string &psk) { mesh_psk_ = psk; }
-  void set_tracker_id(const std::string &id) { tracker_id_ = id; }
   void set_test_broadcast(bool v) { test_broadcast_ = v; }
   /* local_role: 1 = primary (owns wind sensor), 2 = secondary */
   void set_local_role(uint8_t r) { local_role_ = r; }
@@ -365,8 +371,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   uint8_t mesh_channel_{0};
   std::string mesh_psk_{};
   uint8_t mesh_key_[16]{};      /* derived from psk_ via SHA-256 trunc (deterministic) */
-  uint8_t my_mac_[6]{};         /* cached at mesh_setup_; never changes at runtime */
-  std::string tracker_id_{};
+  uint8_t my_mac_[6]{};         /* cached at mesh_setup_; used for gateway election */
+  char wire_id_[32]{};          /* 32-byte NUL-padded node_name from App.get_name() */
   bool mesh_enabled_{false};
   bool test_broadcast_{false};
 
@@ -375,21 +381,29 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   ESPPreferenceObject pref_tx_counter_;
   static constexpr uint32_t CTR_FLUSH_EVERY = 100;
 
-  /* --- Per-peer last-accepted counter (replay protection) --- */
-  std::map<std::array<uint8_t, 6>, uint32_t> peer_last_ctr_;
+  /* --- Boot epoch + flash persistence (P4-12 replay protection) --- */
+  uint16_t boot_epoch_{0};
+  ESPPreferenceObject pref_boot_epoch_;
+
+  /* --- Per-peer last-accepted (epoch, ctr) tuple -- replay protection ---
+   * Keyed by node_name (32-byte fixed-width ASCII, NUL-padded). */
+  struct SessionKey {
+    uint16_t epoch{0};
+    uint32_t ctr{0};
+  };
+  std::map<std::array<char, 32>, SessionKey> peer_last_session_;
 
   /* --- Statically declared peer entities (populated at codegen from YAML) ---
    * Separate from peers_ (which tracks runtime broadcast state).
-   * PeerDecl is keyed by station MAC exactly as in the YAML peers: block. */
+   * PeerDecl is keyed by node_name (32-byte fixed-width ASCII, NUL-padded). */
   struct PeerDecl {
-    std::string id_label;
     sensor::Sensor *az{nullptr};
     sensor::Sensor *el{nullptr};
     sensor::Sensor *wind{nullptr};
     text_sensor::TextSensor *mode{nullptr};
     /* Config number entities -- wired by number.py; used for future GET_RESP
-     * read-back (Task 12).  Pointers stored here so the dispatcher can
-     * publish_state when a CFG_OP_GET_RESP arrives. */
+     * read-back.  Pointers stored here so the dispatcher can publish_state
+     * when a CFG_OP_GET_RESP arrives. */
 #ifdef USE_NUMBER
     number::Number *wind_storm{nullptr};
     number::Number *wind_release{nullptr};
@@ -397,7 +411,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     number::Number *track_thresh{nullptr};
 #endif
   };
-  std::map<std::array<uint8_t, 6>, PeerDecl> peer_decls_;
+  std::map<std::array<char, 32>, PeerDecl> peer_decls_;
 
   /* --- Per-peer application state (gateway election + HA publishing) --- */
   struct PeerEntry {
@@ -405,8 +419,9 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     uint32_t last_telemetry_ms{0};
     uint8_t az_pct{0}, el_pct{0}, wind_used{0};
     std::string mode{};
+    uint8_t mac[6]{};             /* last-seen source MAC for this peer (unicast targeting) */
   };
-  std::map<std::array<uint8_t, 6>, PeerEntry> peers_;
+  std::map<std::array<char, 32>, PeerEntry> peers_;
 
   static constexpr uint32_t HB_STALE_MS = 15000;   // 3 missed @ 5s
 
@@ -415,9 +430,21 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 
   /* ---- mesh_setup_: derive key, restore counter, init ESP-NOW ---- */
   void mesh_setup_() {
-    /* Cache own MAC once; used by self-guard in mesh_dispatch_ and
-     * gateway election -- avoids repeated WiFi SDK calls at runtime. */
+    /* Cache own MAC once; used by gateway election and MSG_COMMAND targeting. */
     WiFi.macAddress(my_mac_);
+
+    /* Populate wire_id_ from App.get_name().  Truncate with a warning if
+     * the name exceeds 31 chars (the 32nd byte is always NUL). */
+    {
+      const std::string &name = App.get_name();
+      if (name.size() > 31) {
+        ESP_LOGW(TAG, "esphome.name '%s' is %u chars, truncating to 31 for node_name",
+                 name.c_str(), (unsigned)name.size());
+      }
+      memset(wire_id_, 0, sizeof(wire_id_));
+      size_t copy_len = name.size() < 31 ? name.size() : 31;
+      memcpy(wire_id_, name.c_str(), copy_len);
+    }
 
     /* Derive a 16-byte AES key from the passphrase via SHA-256 truncation.
      * Deterministic: operators can use a human-readable string in YAML. */
@@ -437,6 +464,13 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     pref_tx_counter_.save(&tx_counter_);
     global_preferences->sync();
 
+    /* Restore and increment boot epoch for cross-boot replay protection. */
+    pref_boot_epoch_ = global_preferences->make_preference<uint16_t>(0xC0DEEEEC);
+    if (!pref_boot_epoch_.load(&boot_epoch_)) boot_epoch_ = 0;
+    boot_epoch_++;
+    pref_boot_epoch_.save(&boot_epoch_);
+    global_preferences->sync();
+
     /* Init ESP-NOW.  WiFi must already be associated on mesh_channel_. */
     if (esp_now_init() != 0) {
       ESP_LOGE(TAG, "esp_now_init failed");
@@ -452,8 +486,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* Register broadcast peer (FF:FF:FF:FF:FF:FF). */
     uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_now_add_peer(bcast, ESP_NOW_ROLE_SLAVE, mesh_channel_, NULL, 0);
-    ESP_LOGI(TAG, "Mesh enabled: channel=%u tracker_id=%s role=%u",
-             mesh_channel_, tracker_id_.c_str(), (unsigned)local_role_);
+    ESP_LOGI(TAG, "Mesh enabled: channel=%u name=%s epoch=%u role=%u",
+             mesh_channel_, wire_id_, (unsigned)boot_epoch_, (unsigned)local_role_);
 
     /* Every 5 s: TELEMETRY (always), WIND (if primary), GATEWAY_HB (if WiFi up) */
     this->set_interval("mesh_broadcasts", 5000, [this]() {
@@ -476,36 +510,46 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 
   /* ---- mesh_tx_: encrypt + broadcast a single mesh frame ---- */
   /*
-   * Frame layout (binary):
+   * Frame layout (binary), P4-12:
    *   [0]      type       (1 byte)
    *   [1..6]   src MAC    (6 bytes)
-   *   [7..10]  ctr        (4 bytes, big-endian)
-   *   [11..]   ciphertext (plen bytes)
+   *   [7..8]   epoch      (2 bytes, big-endian)
+   *   [9..12]  ctr        (4 bytes, big-endian)
+   *   [13..44] node_name  (32 bytes, NUL-padded ASCII)
+   *   [45..]   ciphertext (plen bytes, AES-128-GCM encrypted)
    *   [..+8]   AES-GCM tag (8 bytes)
    *
-   * AAD covers bytes [0..10] (type + header), so a tampered type or
-   * counter is detected by the tag check.
+   * Header = 1+6+2+4+32 = 45 bytes.
+   * AAD covers all 45 header bytes.
+   * Nonce: src(6) || epoch(2) || ctr(4) = 12 bytes.
    */
+  static constexpr size_t MESH_HDR = 45;   /* header size in bytes */
+
   void mesh_tx_(uint8_t type, const uint8_t *payload_in, size_t plen) {
     /* Guard: pkt is sized for at most 64 bytes of plaintext. */
     if (plen > 64) {
       ESP_LOGE(TAG, "mesh_tx_ plen %u > 64", (unsigned)plen);
       return;
     }
-    /* Maximum ESP-NOW payload is 250 bytes; 11 header + 8 tag = 19 bytes
-     * of overhead, leaving 231 bytes for plaintext.  64 is well within. */
-    uint8_t pkt[1 + 6 + 4 + 64 + 8];
+    /* Maximum ESP-NOW payload is 250 bytes; 45 header + 8 tag = 53 bytes
+     * of overhead, leaving 197 bytes for plaintext.  64 is well within. */
+    uint8_t pkt[MESH_HDR + 64 + 8];
 
-    /* Header */
+    /* Header: type */
     pkt[0] = type;
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    memcpy(pkt + 1, mac, 6);
+    /* src MAC */
+    memcpy(pkt + 1, my_mac_, 6);
+    /* epoch (big-endian) */
+    pkt[7] = (boot_epoch_ >> 8) & 0xFF;
+    pkt[8] =  boot_epoch_       & 0xFF;
+    /* ctr (big-endian) */
     uint32_t ctr = ++tx_counter_;
-    pkt[7]  = (ctr >> 24) & 0xFF;
-    pkt[8]  = (ctr >> 16) & 0xFF;
-    pkt[9]  = (ctr >>  8) & 0xFF;
-    pkt[10] =  ctr        & 0xFF;
+    pkt[9]  = (ctr >> 24) & 0xFF;
+    pkt[10] = (ctr >> 16) & 0xFF;
+    pkt[11] = (ctr >>  8) & 0xFF;
+    pkt[12] =  ctr        & 0xFF;
+    /* node_name (32 bytes, NUL-padded) */
+    memcpy(pkt + 13, wire_id_, 32);
 
     /* Persist counter every CTR_FLUSH_EVERY ticks */
     if ((ctr % CTR_FLUSH_EVERY) == 0) {
@@ -516,85 +560,93 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* AES-128-GCM encrypt */
     GCM<AES128> gcm;
     gcm.setKey(mesh_key_, 16);
-    /* Nonce: src(6) || ctr(4) || 0x0000 = 12 bytes */
+    /* Nonce: src(6) || epoch(2) || ctr(4) = 12 bytes */
     uint8_t nonce[12];
-    memcpy(nonce, mac, 6);
-    memcpy(nonce + 6, pkt + 7, 4);
-    nonce[10] = 0;
-    nonce[11] = 0;
+    memcpy(nonce,     pkt + 1, 6);   /* src MAC */
+    memcpy(nonce + 6, pkt + 7, 2);   /* epoch */
+    memcpy(nonce + 8, pkt + 9, 4);   /* ctr */
     gcm.setIV(nonce, 12);
-    /* AAD: type byte + src MAC + counter.  Tag size is fixed at 8 via
-     * the computeTag/checkTag length argument; GCM has no separate
-     * setTagSize() in this library. */
-    gcm.addAuthData(pkt, 1 + 6 + 4);
-    /* Encrypt payload into pkt at byte 11; tag follows at pkt[11+plen] */
-    gcm.encrypt(pkt + 11, payload_in, plen);
+    /* AAD: entire 45-byte header.  Tag size is fixed at 8 via the
+     * computeTag/checkTag length argument. */
+    gcm.addAuthData(pkt, MESH_HDR);
+    /* Encrypt payload into pkt at byte MESH_HDR; tag follows */
+    gcm.encrypt(pkt + MESH_HDR, payload_in, plen);
     uint8_t tag[8];
     gcm.computeTag(tag, 8);
-    memcpy(pkt + 11 + plen, tag, 8);
+    memcpy(pkt + MESH_HDR + plen, tag, 8);
 
     /* Broadcast */
     uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    esp_now_send(bcast, pkt, 11 + plen + 8);
+    esp_now_send(bcast, pkt, MESH_HDR + plen + 8);
   }
 
   /* ---- mesh_rx_: decrypt + auth + replay-check an incoming frame ---- */
-  void mesh_rx_(uint8_t *mac, uint8_t *data, uint8_t len) {
-    /* Minimum frame: 1+6+4 header + 0 ciphertext + 8 tag = 19 bytes */
-    if (len < 1 + 6 + 4 + 0 + 8) return;
+  void mesh_rx_(uint8_t * /*mac*/, uint8_t *data, uint8_t len) {
+    /* Minimum frame: MESH_HDR(45) + 0 ciphertext + 8 tag = 53 bytes */
+    if (len < MESH_HDR + 8) return;
 
     uint8_t type = data[0];
     uint8_t src[6];
     memcpy(src, data + 1, 6);
-    uint32_t ctr = ((uint32_t)data[7]  << 24)
-                 | ((uint32_t)data[8]  << 16)
-                 | ((uint32_t)data[9]  <<  8)
-                 |  (uint32_t)data[10];
-    size_t plen = (size_t)len - (1 + 6 + 4 + 8);
+    uint16_t epoch = ((uint16_t)data[7] << 8) | (uint16_t)data[8];
+    uint32_t ctr   = ((uint32_t)data[9]  << 24)
+                   | ((uint32_t)data[10] << 16)
+                   | ((uint32_t)data[11] <<  8)
+                   |  (uint32_t)data[12];
+    /* node_name: 32 bytes at offset 13 */
+    std::array<char, 32> name_key;
+    memcpy(name_key.data(), data + 13, 32);
 
-    /* Replay protection: reject any frame with a non-advancing counter. */
-    std::array<uint8_t, 6> peer_key{src[0], src[1], src[2],
-                                    src[3], src[4], src[5]};
-    auto it = peer_last_ctr_.find(peer_key);
-    if (it != peer_last_ctr_.end() && ctr <= it->second) {
-      ESP_LOGD(TAG, "replay drop src=%02X..%02X ctr=%u last=%u",
-               src[0], src[5], ctr, it->second);
-      return;
+    size_t plen = (size_t)len - (MESH_HDR + 8);
+
+    /* Replay protection: accept only if (epoch, ctr) strictly advances. */
+    auto sit = peer_last_session_.find(name_key);
+    if (sit != peer_last_session_.end()) {
+      const SessionKey &last = sit->second;
+      bool advanced = (epoch > last.epoch) ||
+                      (epoch == last.epoch && ctr > last.ctr);
+      if (!advanced) {
+        ESP_LOGD(TAG, "replay drop name=%.32s epoch=%u ctr=%u last=(%u,%u)",
+                 name_key.data(), epoch, ctr, last.epoch, last.ctr);
+        return;
+      }
     }
 
     /* AES-128-GCM decrypt */
     GCM<AES128> gcm;
     gcm.setKey(mesh_key_, 16);
+    /* Nonce: src(6) || epoch(2) || ctr(4) = 12 bytes */
     uint8_t nonce[12];
-    memcpy(nonce, src, 6);
-    memcpy(nonce + 6, data + 7, 4);
-    nonce[10] = 0;
-    nonce[11] = 0;
+    memcpy(nonce,     data + 1,  6);  /* src MAC */
+    memcpy(nonce + 6, data + 7,  2);  /* epoch */
+    memcpy(nonce + 8, data + 9,  4);  /* ctr */
     gcm.setIV(nonce, 12);
-    gcm.addAuthData(data, 1 + 6 + 4);
+    gcm.addAuthData(data, MESH_HDR);
     uint8_t plaintext[64];
     if (plen > sizeof(plaintext)) {
       ESP_LOGD(TAG, "oversized payload %u from %02X..%02X", (unsigned)plen,
                src[0], src[5]);
       return;
     }
-    gcm.decrypt(plaintext, data + 11, plen);
-    if (!gcm.checkTag(data + 11 + plen, 8)) {
+    gcm.decrypt(plaintext, data + MESH_HDR, plen);
+    if (!gcm.checkTag(data + MESH_HDR + plen, 8)) {
       ESP_LOGD(TAG, "AES auth fail src=%02X..%02X", src[0], src[5]);
       return;
     }
 
     /* Authenticated -- update replay table and dispatch. */
-    peer_last_ctr_[peer_key] = ctr;
-    mesh_dispatch_(type, src, plaintext, plen);
+    peer_last_session_[name_key] = SessionKey{epoch, ctr};
+    mesh_dispatch_(type, src, name_key, plaintext, plen);
   }
 
   /* ---- mesh_dispatch_: route inbound frames (Task 8+) ---- */
   void mesh_dispatch_(uint8_t type, uint8_t src[6],
+                      const std::array<char, 32> &name_key,
                       const uint8_t *p, size_t plen) {
-    ESP_LOGI(TAG, "mesh rx type=%u from %02X:%02X:%02X:%02X:%02X:%02X plen=%u",
+    ESP_LOGI(TAG, "mesh rx type=%u from %02X:%02X:%02X:%02X:%02X:%02X name=%.32s plen=%u",
              type,
              src[0], src[1], src[2], src[3], src[4], src[5],
+             name_key.data(),
              (unsigned)plen);
     switch (type) {
       case MSG_WIND:
@@ -618,23 +670,24 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         }
         break;
       case MSG_GATEWAY_HB: {
-        /* Drop self-echo before any peer-state mutation. */
-        if (std::memcmp(src, my_mac_, 6) == 0) break;
-        std::array<uint8_t, 6> key{src[0],src[1],src[2],src[3],src[4],src[5]};
-        peers_[key].last_gateway_hb_ms = millis();
+        /* Drop self-echo by node_name comparison. */
+        if (std::memcmp(name_key.data(), wire_id_, 32) == 0) break;
+        auto &e = peers_[name_key];
+        e.last_gateway_hb_ms = millis();
+        memcpy(e.mac, src, 6);
         break;
       }
       case MSG_TELEMETRY: {
         if (plen < 4) return;
-        /* Drop self-echo before any peer-state mutation. */
-        if (std::memcmp(src, my_mac_, 6) == 0) break;
-        std::array<uint8_t, 6> key{src[0],src[1],src[2],src[3],src[4],src[5]};
-        auto &e = peers_[key];
+        /* Drop self-echo by node_name comparison. */
+        if (std::memcmp(name_key.data(), wire_id_, 32) == 0) break;
+        auto &e = peers_[name_key];
         e.last_telemetry_ms = millis();
         e.az_pct = p[0]; e.el_pct = p[1]; e.wind_used = p[2];
         e.mode = mode_from_code_(p[3]);
+        memcpy(e.mac, src, 6);
         /* If we're the acting gateway, publish to HA for this peer */
-        if (is_acting_gateway_()) publish_peer_to_ha_(src, e);
+        if (is_acting_gateway_()) publish_peer_to_ha_(name_key, e);
         break;
       }
       case MSG_COMMAND: {
@@ -800,32 +853,38 @@ class TrackerBridge : public Component, public uart::UARTDevice {
 
   /* Gateway election: returns true iff this node has the lowest MAC among
    * all nodes currently broadcasting GATEWAY_HB within HB_STALE_MS AND
-   * this node itself has WiFi connectivity. */
+   * this node itself has WiFi connectivity.
+   *
+   * peers_ is now keyed by node_name, so we read each entry's stored .mac
+   * field (populated from the src field of their last GATEWAY_HB) for the
+   * MAC-lowest comparison. */
   bool is_acting_gateway_() {
     if (!WiFi.isConnected()) return false;
     uint32_t now = millis();
-    /* Find lowest MAC currently broadcasting GATEWAY_HB within HB_STALE_MS */
+    /* Start with our own MAC as the candidate lowest. */
     std::array<uint8_t, 6> lowest{my_mac_[0],my_mac_[1],my_mac_[2],my_mac_[3],my_mac_[4],my_mac_[5]};
     for (const auto &kv : peers_) {
       if (now - kv.second.last_gateway_hb_ms > HB_STALE_MS) continue;
-      if (kv.first < lowest) lowest = kv.first;
+      /* kv.second.mac holds the last-seen source MAC for this peer. */
+      std::array<uint8_t, 6> pmac;
+      memcpy(pmac.data(), kv.second.mac, 6);
+      if (pmac < lowest) lowest = pmac;
     }
     return std::memcmp(my_mac_, lowest.data(), 6) == 0;
   }
 
-  /* Publish peer telemetry to HA.  Task 11: look up peer_decls_ by MAC
-   * and call publish_state on each wired entity. */
-  void publish_peer_to_ha_(uint8_t src[6], const PeerEntry &e) {
-    std::array<uint8_t, 6> key{src[0], src[1], src[2], src[3], src[4], src[5]};
-    auto it = peer_decls_.find(key);
+  /* Publish peer telemetry to HA.  Looks up peer_decls_ by node_name key
+   * and calls publish_state on each wired entity. */
+  void publish_peer_to_ha_(const std::array<char, 32> &name_key, const PeerEntry &e) {
+    auto it = peer_decls_.find(name_key);
     if (it == peer_decls_.end()) {
-      ESP_LOGW(TAG, "[gateway] unknown peer MAC %02X:%02X:%02X:%02X:%02X:%02X -- not in peer_decls_",
-               src[0], src[1], src[2], src[3], src[4], src[5]);
+      ESP_LOGW(TAG, "[gateway] unknown peer node_name '%.32s' -- not in peer_decls_",
+               name_key.data());
       return;
     }
     auto &d = it->second;
-    ESP_LOGD(TAG, "[gateway] publish peer '%s' az=%u el=%u wind=%u mode=%s",
-             d.id_label.c_str(), e.az_pct, e.el_pct, e.wind_used, e.mode.c_str());
+    ESP_LOGD(TAG, "[gateway] publish peer '%.32s' az=%u el=%u wind=%u mode=%s",
+             name_key.data(), e.az_pct, e.el_pct, e.wind_used, e.mode.c_str());
     if (d.az)   d.az->publish_state(float(e.az_pct));
     if (d.el)   d.el->publish_state(float(e.el_pct));
     if (d.wind) d.wind->publish_state(float(e.wind_used));
@@ -852,14 +911,24 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     ESP_LOGD(TAG, "cmd->STC: %s (crc=%02X)", s, crc);
   }
 
-  /* ---- find_peer_mac_: look up a declared peer MAC by id_label.
-   * Returns pointer to static storage inside the map entry (valid for the
-   * lifetime of peer_decls_).  Returns nullptr if not found. ---- */
-  const uint8_t *find_peer_mac_(const std::string &peer_id) {
-    for (const auto &kv : peer_decls_) {
-      if (kv.second.id_label == peer_id) return kv.first.data();
-    }
+  /* ---- find_peer_mac_: look up a peer's last-seen MAC by node_name.
+   * Returns pointer to static storage inside the peers_ map entry (valid
+   * as long as no rehash occurs, which doesn't happen with std::map).
+   * Returns nullptr if the peer has never broadcast. ---- */
+  const uint8_t *find_peer_mac_(const std::string &peer_name) {
+    auto key = make_name_key_(peer_name);
+    auto it = peers_.find(key);
+    if (it != peers_.end()) return it->second.mac;
+    ESP_LOGW(TAG, "find_peer_mac_: peer '%s' not yet seen on mesh", peer_name.c_str());
     return nullptr;
+  }
+
+  /* ---- make_name_key_: build a 32-byte NUL-padded array from a string ---- */
+  static std::array<char, 32> make_name_key_(const std::string &name) {
+    std::array<char, 32> key{};
+    size_t copy_len = name.size() < 32 ? name.size() : 32;
+    memcpy(key.data(), name.c_str(), copy_len);
+    return key;
   }
 
   /* ---- broadcast_mac_: return a pointer to the FF:FF:FF:FF:FF:FF MAC ---- */
