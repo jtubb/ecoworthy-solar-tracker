@@ -249,7 +249,9 @@ class TestHarness:
             self._log_ring[name].append(line)
             self._log_event.set()
 
-        await client.subscribe_logs(on_log, log_level=5)  # level 5 = VERBOSE
+        # subscribe_logs is a synchronous registration call in aioesphomeapi
+        # (the returned object isn't awaitable).  Just register the callback.
+        client.subscribe_logs(on_log, log_level=5)  # level 5 = VERBOSE
 
     async def _subscribe_states(self, name: str, client: APIClient) -> None:
         entities, services = await client.list_entities_services()
