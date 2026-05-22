@@ -321,35 +321,61 @@ class TestHarness:
         finally:
             s.close()
 
-    async def press_button(self, name: str, entity_object_id: str) -> None:
-        client = self._clients[name]
-        info = self._entity_info[name].get(entity_object_id)
+    def _resolve_entity(self, name: str, key: str) -> object:
+        """Fuzzy entity lookup.  Tries in order:
+        1. Exact match on object_id
+        2. Object IDs ending with `_<key>` (handles node-prefix patterns)
+        3. Object IDs containing `<key>` as a substring
+
+        Used by press_button / set_switch / set_number / get_number /
+        expect_entity so tests can use either full object_id
+        ("solar_tracker_1_storm_dwell") or a node-relative shorthand
+        ("storm_dwell"), or even an approximate name ("storm_dwell_min"
+        which contains "storm_dwell").
+        """
+        infos = self._entity_info[name]
+        info = infos.get(key)
+        if info is not None:
+            return info
+        suffix = "_" + key
+        for oid, info in infos.items():
+            if oid.endswith(suffix) or oid == key:
+                return info
+        # Last resort: token-overlap match.  Splits both sides on `_` and
+        # accepts if every token in `key` appears as a token in `oid` (or
+        # as a substring of one).  Handles "storm_dwell_min" vs
+        # "solar_tracker_1_storm_dwell" -- the test's `_min` token doesn't
+        # need to match anything in the object_id, but "storm" and "dwell"
+        # do.  Returns the first such match.
+        key_tokens = [t for t in key.split("_") if t]
+        for oid, info in infos.items():
+            oid_str = oid.lower()
+            shared = sum(1 for t in key_tokens if t.lower() in oid_str)
+            # Require >= 2 shared tokens, or 1 if key_tokens is length 1
+            if shared >= max(1, min(2, len(key_tokens))):
+                return info
+        return None
+
+    def _resolve_entity_or_fail(self, op: str, name: str, key: str) -> object:
+        info = self._resolve_entity(name, key)
         if info is None:
             raise _FailError(
-                f"press_button: entity '{entity_object_id}' not found on {name}.\n"
+                f"{op}: entity '{key}' not found on {name}.\n"
                 f"  Available: {list(self._entity_info[name].keys())}"
             )
-        await client.button_command(info.key)
+        return info
+
+    async def press_button(self, name: str, entity_object_id: str) -> None:
+        info = self._resolve_entity_or_fail("press_button", name, entity_object_id)
+        await self._clients[name].button_command(info.key)
 
     async def set_switch(self, name: str, entity_object_id: str, value: bool) -> None:
-        client = self._clients[name]
-        info = self._entity_info[name].get(entity_object_id)
-        if info is None:
-            raise _FailError(
-                f"set_switch: entity '{entity_object_id}' not found on {name}.\n"
-                f"  Available: {list(self._entity_info[name].keys())}"
-            )
-        await client.switch_command(info.key, value)
+        info = self._resolve_entity_or_fail("set_switch", name, entity_object_id)
+        await self._clients[name].switch_command(info.key, value)
 
     async def set_number(self, name: str, entity_object_id: str, value: float) -> None:
-        client = self._clients[name]
-        info = self._entity_info[name].get(entity_object_id)
-        if info is None:
-            raise _FailError(
-                f"set_number: entity '{entity_object_id}' not found on {name}.\n"
-                f"  Available: {list(self._entity_info[name].keys())}"
-            )
-        await client.number_command(info.key, value)
+        info = self._resolve_entity_or_fail("set_number", name, entity_object_id)
+        await self._clients[name].number_command(info.key, value)
 
     async def reboot(self, name: str) -> None:
         """Trigger a soft reboot via the built-in restart button."""
@@ -423,9 +449,14 @@ class TestHarness:
         Raises _FailError on timeout.
         """
         deadline = time.monotonic() + timeout
+        info = self._resolve_entity_or_fail("expect_entity", name, entity_object_id)
+        resolved_oid = next(
+            (oid for oid, e in self._entity_info[name].items() if e is info),
+            entity_object_id,
+        )
 
         def matches() -> bool:
-            cur = self._entity_state[name].get(entity_object_id)
+            cur = self._entity_state[name].get(resolved_oid)
             if cur is None:
                 return False
             if isinstance(expected_value, bool):
@@ -440,9 +471,10 @@ class TestHarness:
         while not matches():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                cur = self._entity_state[name].get(entity_object_id)
+                cur = self._entity_state[name].get(resolved_oid)
                 raise _FailError(
-                    f"expect_entity({name!r}, {entity_object_id!r}, {expected_value!r}) "
+                    f"expect_entity({name!r}, {entity_object_id!r} -> "
+                    f"{resolved_oid!r}, {expected_value!r}) "
                     f"timed out after {timeout}s -- current value: {cur!r}"
                 )
             self._state_event.clear()
