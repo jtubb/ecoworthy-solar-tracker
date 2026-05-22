@@ -367,15 +367,17 @@ class TestHarness:
 
     async def press_button(self, name: str, entity_object_id: str) -> None:
         info = self._resolve_entity_or_fail("press_button", name, entity_object_id)
-        await self._clients[name].button_command(info.key)
+        # aioesphomeapi's *_command methods are synchronous fire-and-forget;
+        # they enqueue a request frame and return None, not a coroutine.
+        self._clients[name].button_command(info.key)
 
     async def set_switch(self, name: str, entity_object_id: str, value: bool) -> None:
         info = self._resolve_entity_or_fail("set_switch", name, entity_object_id)
-        await self._clients[name].switch_command(info.key, value)
+        self._clients[name].switch_command(info.key, value)
 
     async def set_number(self, name: str, entity_object_id: str, value: float) -> None:
         info = self._resolve_entity_or_fail("set_number", name, entity_object_id)
-        await self._clients[name].number_command(info.key, value)
+        self._clients[name].number_command(info.key, value)
 
     async def reboot(self, name: str) -> None:
         """Trigger a soft reboot via the built-in restart button."""
