@@ -1957,13 +1957,20 @@ static void uart_cmd_dispatch(state_t *state) {
                 if (val < TRACK_THRESH_MIN || val > TRACK_THRESH_MAX) status = CFG_STATUS_RANGE;
                 else { track_thresh = (unsigned char)val; config_save(); }
                 break;
-            /* All other fields read-only over mesh */
+            case CFG_F_WIND_SOURCE:
+                /* P6-2: mesh-managed.  ESP auto-pushes this on election change
+                 * (0 = use local sensor for the wind primary; 1 = use remote
+                 * broadcast for secondaries).  No longer RO over !cfg set. */
+                if (val > WIND_SOURCE_MAX) status = CFG_STATUS_RANGE;
+                else { wind_source = (unsigned char)val; config_save(); }
+                break;
+            /* All other fields still read-only over mesh -- calibration
+             * data and operator-set role. */
             case CFG_F_NS_STROKE:
             case CFG_F_EW_STROKE:
             case CFG_F_HORIZ_NS:
             case CFG_F_HORIZ_EW:
             case CFG_F_ROLE:
-            case CFG_F_WIND_SOURCE:
                 status = CFG_STATUS_RO;
                 break;
             default:
