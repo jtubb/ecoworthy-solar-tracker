@@ -377,9 +377,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   }
 
   void handle_payload_(const std::string &p) {
-    /* DEBUG: log every payload that reaches handle_payload_.  Drop this
-     * after diagnosing the empty-cache regression. */
-    ESP_LOGD(TAG, "handle_payload_ p='%s' (len=%u)", p.c_str(), (unsigned) p.size());
     /* Half-duplex self-echo: our own outbound poll ("?") and forwarded
      * commands ("!wind=...", "!park", ...) loop back on the single-wire
      * bus.  All start-with-! and start-with-? frames originated here. */
@@ -464,9 +461,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       else if (key == "wind") wind = std::atoi(val.c_str());
       else if (key == "mode") mode = val;
     }
-    /* DEBUG: log what we parsed AND whether the entity pointers are wired. */
-    ESP_LOGD(TAG, "parsed az=%d el=%d wind=%d mode='%s'  az_=%p el_=%p wind_=%p mode_=%p",
-             az, el, wind, mode.c_str(), az_, el_, wind_, mode_);
     if (az_   && az   >= 0) az_->publish_state(float(az));
     if (el_   && el   >= 0) el_->publish_state(float(el));
     if (wind_ && wind >= 0) wind_->publish_state(float(wind));
@@ -723,11 +717,22 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       }
       /* --- Local STC (always, regardless of gateway role) ---
        * The STC reply flows through handle_payload_ which publishes the
-       * local slider and, if mesh is up, broadcasts GET_RESP for peers. */
-      for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4}) {
-        char buf[20];
-        int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", (unsigned)fid);
-        if (sn > 0 && (size_t)sn < sizeof(buf)) this->write_str_frame_(buf);
+       * local slider and, if mesh is up, broadcasts GET_RESP for peers.
+       *
+       * P5-11: stagger the four !cfg get sends by 150 ms each.  Issuing
+       * them back-to-back overflows the half-duplex single-wire bus:
+       * the STC starts replying after parsing frame 1 while the ESP is
+       * still TXing frames 3/4, and the collision drops one reply (id=3
+       * in observed bench logs).  150 ms is ~7x per-frame airtime at
+       * 9600 baud, plenty for the STC reply to land before the next
+       * request goes out. */
+      for (uint8_t i = 0; i < 4; i++) {
+        uint8_t fid = uint8_t(i + 1);
+        this->set_timeout(uint32_t(i) * 150u, [this, fid]() {
+          char buf[20];
+          int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", (unsigned)fid);
+          if (sn > 0 && (size_t)sn < sizeof(buf)) this->write_str_frame_(buf);
+        });
       }
     });
   }
