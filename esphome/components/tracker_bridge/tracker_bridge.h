@@ -795,10 +795,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     switch (type) {
       case MSG_WIND:
         if (plen < 2) return;
-        /* The primary is the sender of WIND broadcasts.  ESP-NOW broadcasts
-         * loop back to the sender on ESP8266 ROLE_COMBO, so the primary
-         * receives its own packet -- skip the forward to avoid a redundant
-         * !wind= command to the primary's own STC. */
+        /* Self-echo guard (consistency with TELEMETRY/GATEWAY_HB): a node's
+         * own ESP-NOW broadcast loops back on ROLE_COMBO. */
+        if (std::memcmp(name_key.data(), wire_id_, 32) == 0) break;
+        /* The primary owns the wind sensor; don't apply another primary's
+         * reading to our STC even in a rare dual-primary deployment. */
         if (local_role_ == ROLE_PRIMARY) break;
         /* Forward wind value to local STC via the !wind=NN framed command.
          * Secondary nodes relay primary's wind reading to their STC so the
