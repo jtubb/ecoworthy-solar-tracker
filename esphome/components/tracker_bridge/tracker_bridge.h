@@ -522,7 +522,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   };
   std::map<std::array<char, 32>, PeerEntry> peers_;
 
-  static constexpr uint32_t HB_STALE_MS = 15000;   // 3 missed @ 5s
+  static constexpr uint32_t HB_STALE_MS   = 15000;  // 3 missed @ 5s
+  static constexpr uint32_t PEER_STALE_MS = 60000;  // 12 missed @ 5s
 
   /* Singleton pointer -- ESP-NOW C callback has no user-data parameter. */
   static TrackerBridge *instance_;
@@ -589,11 +590,13 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     ESP_LOGI(TAG, "Mesh enabled: channel=%u name=%s epoch=%u role=%u",
              mesh_channel_, wire_id_, (unsigned)boot_epoch_, (unsigned)local_role_);
 
-    /* Every 5 s: TELEMETRY (always), WIND (if primary), GATEWAY_HB (if WiFi up) */
+    /* Every 5 s: TELEMETRY (always), WIND (if primary), GATEWAY_HB (if WiFi up),
+     * then prune stale peers_ entries (60 s / PEER_STALE_MS threshold). */
     this->set_interval("mesh_broadcasts", 5000, [this]() {
       this->mesh_tx_telemetry_();
       if (this->local_role_ == ROLE_PRIMARY) this->mesh_tx_wind_();
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
+      this->peers_prune_();
     });
 
     /* Every 30 s: acting gateway polls each declared remote peer for its 4
@@ -1053,6 +1056,42 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       if (pmac < lowest) lowest = pmac;
     }
     return std::memcmp(my_mac_, lowest.data(), 6) == 0;
+  }
+
+  /* ---- peers_prune_: remove peers_ entries that have gone silent ----
+   * A peer is considered stale when BOTH last_telemetry_ms AND
+   * last_gateway_hb_ms are older than PEER_STALE_MS (60 s = 12 missed
+   * 5-second broadcasts).  Either timestamp alone being recent is enough
+   * to keep the entry -- the peer may be a secondary with no WiFi (no HB)
+   * or a node that had a status poll gap (no TELEMETRY for a few cycles).
+   *
+   * peer_decls_: NOT touched -- operator-declared static entries survive.
+   * peer_last_session_: NOT pruned here -- replay-protection state must
+   *   outlive the peer so a long-silent node can't slip a replayed frame
+   *   through after its peers_ entry is pruned.  Pruning replay state has
+   *   security implications (a removed entry resets the (epoch,ctr) floor
+   *   to zero, enabling old captured frames to authenticate again).
+   *   A separate, much-longer-timeout prune pass for peer_last_session_
+   *   may be added in a future task once the threat model is assessed. */
+  void peers_prune_() {
+    if (peers_.empty()) return;
+    uint32_t now  = millis();
+    uint32_t removed = 0;
+    for (auto it = peers_.begin(); it != peers_.end(); ) {
+      /* Wrap-safe uint32_t subtraction (matches is_acting_gateway_ idiom). */
+      bool tele_stale = (now - it->second.last_telemetry_ms)   > PEER_STALE_MS;
+      bool hb_stale   = (now - it->second.last_gateway_hb_ms)  > PEER_STALE_MS;
+      if (tele_stale && hb_stale) {
+        it = peers_.erase(it);
+        removed++;
+      } else {
+        ++it;
+      }
+    }
+    if (removed > 0) {
+      ESP_LOGD(TAG, "peers_prune_: removed %u stale peers, %u remain",
+               (unsigned)removed, (unsigned)peers_.size());
+    }
   }
 
   /* Publish peer telemetry to HA.  Looks up peer_decls_ by node_name key
