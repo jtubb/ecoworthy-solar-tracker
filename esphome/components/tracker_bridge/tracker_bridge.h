@@ -377,6 +377,9 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   }
 
   void handle_payload_(const std::string &p) {
+    /* DEBUG: log every payload that reaches handle_payload_.  Drop this
+     * after diagnosing the empty-cache regression. */
+    ESP_LOGD(TAG, "handle_payload_ p='%s' (len=%u)", p.c_str(), (unsigned) p.size());
     /* Half-duplex self-echo: our own outbound poll ("?") and forwarded
      * commands ("!wind=...", "!park", ...) loop back on the single-wire
      * bus.  All start-with-! and start-with-? frames originated here. */
@@ -461,6 +464,9 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       else if (key == "wind") wind = std::atoi(val.c_str());
       else if (key == "mode") mode = val;
     }
+    /* DEBUG: log what we parsed AND whether the entity pointers are wired. */
+    ESP_LOGD(TAG, "parsed az=%d el=%d wind=%d mode='%s'  az_=%p el_=%p wind_=%p mode_=%p",
+             az, el, wind, mode.c_str(), az_, el_, wind_, mode_);
     if (az_   && az   >= 0) az_->publish_state(float(az));
     if (el_   && el   >= 0) el_->publish_state(float(el));
     if (wind_ && wind >= 0) wind_->publish_state(float(wind));
