@@ -26,9 +26,10 @@ rweather/Crypto + AES-128-GCM (ESP).
 | P5-5 | `peers_` LRU pruning / size cap | Med | Low | Low | Bounds memory if rogue peers join |
 | P5-6 | Per-peer COMMAND buttons (goto, jog, calibrate) | Med | Med | Low | Exposes existing C++ methods to HA UI |
 | P5-7 | STC role sync from EEPROM → ESP YAML | Med | Med | Med | Eliminates `local_role:` YAML duplication |
-| P5-8 | ESPHome dashboard bind-mount workflow doc | High | Trivial | Low | Prevents the YAML-drift bug from recurring |
 | P5-9 | Wind override slider gated by `local_role` | Low | Trivial | Low | Hides bench-helper from STC-equipped nodes |
 | P5-10 | Schema validate `esphome.name <= 31 chars` at codegen | Low | Low | Low | Catch the truncation case before runtime warn |
+
+(P5-8 — ESPHome dashboard bind-mount workflow doc — was dropped from scope.)
 
 ---
 
@@ -349,31 +350,6 @@ Note: this task depends on P5-2 (the `cfg id=N val=V` STC-reply parser).
 
 ---
 
-## Task P5-8: ESPHome dashboard bind-mount workflow doc
-
-**Files:**
-- Create: `EcoWorthyFirmware/esphome/README.md` OR add a section to `EcoWorthyFirmware/README.md`
-- Optionally create: `docker-compose.example.yml` at repo root
-
-**Why:** The 3-hour P4-12 debug session was caused by repo YAMLs being edited while the ESPHome
-dashboard was compiling its own (older) copies. A documented workflow prevents this from biting
-the next operator.
-
-**Approach:** Document the bind-mount approach: in your docker-compose, set the ESPHome
-container's `/config` volume to mount this repo's `EcoWorthyFirmware/esphome/` directory.
-Then `git pull` automatically updates the dashboard's YAMLs.
-
-- [ ] **Step 1: Write the workflow doc (markdown, ~50 lines)**
-- [ ] **Step 2: Include a sample docker-compose snippet**
-- [ ] **Step 3: Document the alternative (manual sync) for operators who can't bind-mount**
-- [ ] **Step 4: Commit**
-
-```
-git commit -m "docs: P5-8 -- ESPHome dashboard YAML workflow / bind-mount recipe"
-```
-
----
-
 ## Task P5-9: Wind override slider gated by `local_role`
 
 **Files:**
@@ -430,11 +406,9 @@ git commit -m "fix(esp): P5-10 -- reject esphome.name > 31 chars when mesh: is c
 
 - All tasks are independent — pick any subset.
 - P5-7 depends on P5-2 (STC `cfg id=N val=V` parser).
-- P5-1, P5-2, P5-4, P5-5 should land together as the "mesh hardening" pass since they touch
-  the same areas of code.
-- P5-3, P5-8, P5-9, P5-10 are independent cleanups.
+- P5-1, P5-2, P5-4, P5-5 share the dispatcher code surface — economical to bundle reviews.
+- P5-3, P5-9, P5-10 are independent cleanups.
 - P5-6 (per-peer buttons) is a UX feature; not blocking anything else.
 
-Recommended execution order if doing all: P5-3, P5-8 (one-line + doc, ship first), then
-P5-1, P5-4, P5-5 (mesh hardening pass), then P5-2 (CONFIG read-back, largest task),
-then P5-7 (depends on P5-2), then P5-6, P5-9, P5-10 (UX polish).
+**Execution order (locked):** numerical order P5-1, P5-2, P5-3, P5-4, P5-5, P5-6, P5-7, P5-9, P5-10.
+P5-8 dropped from scope.
