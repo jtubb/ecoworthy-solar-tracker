@@ -928,8 +928,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
           /* Don't process our own echoed GET_RESP */
           if (memcmp(p + 1, wire_id_, 32) == 0) break;
           auto src_key = make_name_key_(std::string((const char *)(p + 1), 32));
-          /* Truncate at first NUL for clean logging; key itself is already NUL-padded. */
-          src_key[31] = '\0';
           auto it = peer_decls_.find(src_key);
           if (it == peer_decls_.end()) {
             ESP_LOGD(TAG, "GET_RESP from undeclared peer '%.32s' -- ignored", src_key.data());
