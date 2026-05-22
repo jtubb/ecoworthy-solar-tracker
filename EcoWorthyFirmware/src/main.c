@@ -1580,9 +1580,14 @@ static void storm_check(state_t *state) {
      * gated below; the cache update is unconditional so jog/idle still
      * see live wind even when uncalibrated or already storming. */
     if (wind_source == 0) {
-        /* Local: read sensor as before */
+        /* Local: read sensor as before.  wind_failsafe is meaningless when
+         * we're using the local sensor (the failsafe only applies to the
+         * remote-broadcast path).  Clear it here so a transition from
+         * wind_source=1 -> 0 doesn't leave a stuck flag blocking the
+         * storm-exit dwell gate. */
         w = wind_mps(adc_read_avg(ADC_CH_WIND, 8));
         wind_mps_cached = w;
+        wind_failsafe = 0;
     } else {
         /* Remote: use cached value from !wind= broadcast.  Failsafe
          * arms after REMOTE_WIND_TIMEOUT_MS of silence and auto-clears
