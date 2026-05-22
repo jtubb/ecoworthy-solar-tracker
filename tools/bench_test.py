@@ -579,13 +579,19 @@ async def test_force_park_release(h: TestHarness) -> None:
 
     try:
         # --- Press Force Park ---
+        # Capture the cursor BEFORE the button press: expect_log defaults to a
+        # 100 ms back-window, but the t2 'mesh rx type=4' arrives within
+        # milliseconds of the press, while expect_entity below can take several
+        # seconds.  Without an explicit since=, the log line ages out of the
+        # window before we look for it.
+        since_park = time.monotonic()
         await h.press_button(t1, "force_park")
 
         # Tracker-1 STC should enter storm
         await h.expect_entity(t1, "mode", "storm", timeout=15)
 
         # Tracker-2 should relay the mesh command (no STC, so check mesh rx log)
-        await h.expect_log(t2, r"mesh rx type=4", timeout=15)
+        await h.expect_log(t2, r"mesh rx type=4", timeout=15, since=since_park)
 
         # --- Press Force Release ---
         since_release = time.monotonic()
@@ -608,38 +614,65 @@ async def test_force_park_release(h: TestHarness) -> None:
 
 async def test_wsrc_failsafe_recovery(h: TestHarness) -> None:
     """
-    Set WSrc=1 (remote-wind required) on tracker-1 via UART, then verify
-    that the failsafe fires when no WIND mesh frames arrive (tracker-2 has
-    has_wind_sensor=false and never broadcasts WIND).
+    MANUAL TEST -- requires temporarily disabling P6-2's WSrc auto-sync, or
+    making both nodes has_wind_sensor=true so the election outcome can be
+    flipped at runtime.
 
-    Recovery path: restore WSrc=0 (no remote wind required) and verify
-    tracker-1 exits storm.
+    Validates that with WSrc=1 (remote-wind required) on tracker-1 and no
+    incoming WIND broadcasts, the STC failsafe fires within ~15-30s, and
+    that setting WSrc=0 recovers the mode to track/idle.
 
-    NOTE: This test validates failsafe arming + WSrc=0 recovery only.
-    Auto-recovery from incoming remote WIND is covered by test_no_primary_baseline
-    (which tests the broadcast-absent case) but full end-to-end WIND-driven
-    recovery requires a second has_wind_sensor node -- see test_dual_primary
-    for that manual variant.
+    Why manual: when this test was first written WSrc was directly settable
+    via `!cfg set id=33 val=N` over a raw UART stream (port 23 / stream_server).
+    Two things changed since:
+      1. stream_server was disabled in the dashboard YAML on 2026-05-22 after
+         it was diagnosed as the source of UART-RX-drained-by-second-consumer
+         (see the same-day boot log in conversation history).
+      2. P6-2 (commit 97676ec, reapplied 2d4e550) now auto-pushes WSrc from
+         the elected-primary outcome every cfg_poll cycle.  Any manual
+         WSrc=1 set is overwritten by WSrc=0 on the next 30s tick if
+         tracker-1 remains the elected primary.
+
+    The production test path is now: flip the election outcome (e.g. make
+    tracker-2 also has_wind_sensor=true and lower-MAC) -> P6-2 auto-pushes
+    WSrc=1 to tracker-1 -> failsafe arms when tracker-2 also goes offline.
+    That requires a YAML edit + reflash, identical to the dual_primary test.
+
+    Rerun instructions:
+      1. Edit EcoWorthyFirmware/esphome/solar-tracker-2.yaml:
+             has_wind_sensor: false  ->  has_wind_sensor: true
+      2. esphome run EcoWorthyFirmware/esphome/solar-tracker-2.yaml
+      3. python tools/bench_test.py --test test_wsrc_failsafe_recovery --include-manual
+      4. Revert the YAML and reflash tracker-2 to restore production config.
     """
+    if not MANUAL_FLAG:
+        raise _ManualSkip(
+            "Requires solar-tracker-2.yaml has_wind_sensor: true + reflash to "
+            "drive a WSrc=1 state through P6-2's auto-sync.  Run with --include-manual "
+            "after the manual reflash steps in this docstring."
+        )
     t1 = "solar-tracker-1"
+    t2 = "solar-tracker-2"
 
-    # WSrc=1 means "require remote WIND broadcast" (config field id=33 in STC).
-    # There is no HA slider for field 33 so we send it directly via UART.
-    await h.send_uart_cmd(t1, "!cfg set id=33 val=1")
-    await asyncio.sleep(3)  # let STC absorb the config
+    # With both has_wind_sensor=true, lower-MAC wins -- expect that to be t2.
+    # Take t2 offline so t1 is the only candidate, then bring t2 back: when
+    # t2 re-asserts primary (lower MAC), P6-2 pushes WSrc=1 to t1.
+    # Then take t2 offline again so no WIND arrives -> failsafe arms.
+    await h.set_switch(t2, "test_offline_switch", True)
+    await asyncio.sleep(70)  # peer stale window + margin
 
     try:
-        # With WSrc=1 and no WIND broadcasts arriving (tracker-2 has no sensor),
-        # the STC failsafe should arm and push to storm within ~15-30 s.
-        await h.expect_entity(t1, "mode", "storm", timeout=45)
+        await h.set_switch(t2, "test_offline_switch", False)
+        await asyncio.sleep(35)  # one cfg_poll cycle + margin -- P6-2 should push WSrc=1
+        await h.set_switch(t2, "test_offline_switch", True)
+        # Now no WIND inbound; t1's failsafe should arm and push to storm.
+        await h.expect_entity(t1, "mode", "storm", timeout=60)
 
     finally:
-        # Restore WSrc=0 (local wind, no remote required)
-        await h.send_uart_cmd(t1, "!cfg set id=33 val=0")
-        await asyncio.sleep(3)
-
-        # Verify recovery: mode should return to track or idle
-        # We check for track first; if dwell hasn't cleared yet, check idle.
+        # Restore production config: t2 visible, P6-2 will re-push WSrc=0 to t1
+        # on next cfg_poll (since t1 will be the lowest-MAC has_wind_sensor again
+        # if t2 stays online or test_offline=False).
+        await h.set_switch(t2, "test_offline_switch", False)
         deadline = time.monotonic() + 90
         recovered = False
         for target_mode in ("track", "idle"):
@@ -654,7 +687,7 @@ async def test_wsrc_failsafe_recovery(h: TestHarness) -> None:
             cur = h._entity_state[t1].get("mode")
             raise _FailError(
                 f"test_wsrc_failsafe_recovery: tracker-1 mode did not recover to "
-                f"'track' or 'idle' within 90s after WSrc=0 restore.  Current: {cur!r}"
+                f"'track' or 'idle' within 90s.  Current: {cur!r}"
             )
 
 
@@ -839,11 +872,14 @@ async def test_ha_command_propagation(h: TestHarness) -> None:
             t2, r"mesh rx type=4", timeout=15.0, since=since_park
         )
 
-        # UART debug should show the AA 55 21 70 61 72 6B ("!park") outbound frame
-        # on tracker-1 (uart debug logs hex bytes)
+        # tracker_bridge's own LOGD line confirms the command was framed and
+        # written to the STC UART.  This asserts on the production interface,
+        # not on the optional `uart: debug:` hex tap (which competes with the
+        # bridge for the UART RX buffer -- see docs/superpowers/plans/2026-05-21
+        # -phase-5-deferred-cleanups.md, P5-11 background).
         await h.expect_log(
             t1,
-            r"AA 55 21 70 61 72 6B",
+            r"cmd->STC: !park",
             timeout=10.0,
             since=since_park,
         )
@@ -897,17 +933,13 @@ async def test_cfg_get_resp_readback(h: TestHarness) -> None:
         # The slider is optimistic: it should immediately reflect the new value
         await h.expect_entity(t1, "wind_storm_mps", TEST_VALUE, timeout=5.0)
 
-        # Wait for the cfg_poll to fire (up to 30 s) and push a GET_REQ to the STC.
-        # Then watch for the STC's "cfg id=1 val=17" reply in the log.
+        # Wait for the cfg_poll to fire (up to 30 s) and push a GET_REQ to the
+        # STC.  The "cfg reply: fid=1 val=17" log line comes from the STC's
+        # actual UART reply (not from the optimistic slider cache), so this
+        # already verifies the STC stored the value.  No need for a redundant
+        # raw-UART GET.
         await h.expect_log(
             t1, r"cfg reply: fid=1 val=17", timeout=35.0
-        )
-
-        # Also verify via direct UART GET (bypasses optimistic slider)
-        since_uart = time.monotonic()
-        await h.send_uart_cmd(t1, "!cfg get id=1")
-        await h.expect_log(
-            t1, r"cfg reply: fid=1 val=17", timeout=10.0, since=since_uart
         )
 
     finally:
