@@ -157,6 +157,21 @@ number:
     wind_override:
       name: "$friendly_name Wind override"
 
+# --- Bench-test hook: silence outbound traffic without WiFi disconnect --------
+# See solar-tracker-1.yaml for full documentation.  Identical switch on every
+# node so bench_test.py can drive failover tests on either node.
+switch:
+  - platform: template
+    name: "$friendly_name Test Offline"
+    id: test_offline_switch
+    optimistic: true
+    entity_category: diagnostic
+    icon: mdi:test-tube
+    turn_on_action:
+      - lambda: id(bridge).set_test_offline(true);
+    turn_off_action:
+      - lambda: id(bridge).set_test_offline(false);
+
 # --- Debug: runtime baud-rate select (leave at 9600 unless debugging) --
 select:
   - id: change_baud_rate

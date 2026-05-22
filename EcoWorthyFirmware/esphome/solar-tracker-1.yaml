@@ -200,6 +200,24 @@ number:
       max_value: 99
       step: 1
 
+# --- Bench-test hook: silence outbound traffic without WiFi disconnect --------
+# Turning this ON stops the STC poll, mesh broadcasts, and cfg_poll.
+# The node still receives mesh frames and is reachable via the HA API.
+# Useful for simulating a "alive-but-silent" failure mode to test
+# gateway and wind-primary failover without physically disconnecting hardware.
+# entity_category: diagnostic keeps it out of the default HA dashboard view.
+switch:
+  - platform: template
+    name: "$friendly_name Test Offline"
+    id: test_offline_switch
+    optimistic: true
+    entity_category: diagnostic
+    icon: mdi:test-tube
+    turn_on_action:
+      - lambda: id(bridge).set_test_offline(true);
+    turn_off_action:
+      - lambda: id(bridge).set_test_offline(false);
+
 # --- Debug: runtime baud-rate select (leave at 9600 unless debugging) --
 select:
   - id: change_baud_rate

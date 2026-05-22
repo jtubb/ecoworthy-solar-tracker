@@ -19,3 +19,6 @@ EcoWorthyFirmware/build/
 *.swo
 Thumbs.db
 .DS_Store
+
+# Bench-test harness config (contains API keys -- never commit)
+tools/bench_test_config.yaml

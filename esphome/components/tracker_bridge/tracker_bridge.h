@@ -195,6 +195,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * frames.  Set from YAML mesh.has_wind_sensor:; defaults to false. */
   void set_has_wind_sensor(bool v) { has_wind_sensor_ = v; }
 
+  /* Test hook: when true, suppresses outbound STC poll, mesh broadcasts, and
+   * cfg_poll.  The node still receives mesh frames and responds to HA API
+   * queries -- it is "alive but silent", the most useful failure-mode for
+   * bench-testing gateway/primary failover without physically disconnecting
+   * hardware.  Exposed as a template switch in the YAML (entity_category:
+   * diagnostic) so the bench_test.py harness can drive it via the native API.
+   * Default: false (off).  Safe to leave compiled in on production nodes. */
+  void set_test_offline(bool v) { test_offline_ = v; }
+
   /* Bench-helper write path for the wind cache.  Used by the optional
    * WindOverrideNumber to inject synthetic wind values on a node with
    * no STC attached.  On a node WITH an STC, the next status poll (~2 s
@@ -232,7 +241,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* Poll the STC every 2 s.  ESPHome's set_interval handles timing
      * and survives WiFi/HA disconnects -- the bridge keeps polling
      * regardless of upstream state. */
-    this->set_interval("poll", 2000, [this]() { this->send_poll_(); });
+    this->set_interval("poll", 2000, [this]() {
+      if (test_offline_) return;
+      this->send_poll_();
+    });
     ESP_LOGCONFIG(TAG, "tracker_bridge configured");
 
     if (mesh_enabled_) {
@@ -500,6 +512,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * The wind primary is auto-elected: the live has_wind_sensor peer with
    * the lowest MAC becomes the broadcaster.  Defaults to false. */
   bool has_wind_sensor_{false};
+  /* P-bench: set_test_offline(true) silences outbound UART poll + mesh
+   * broadcasts so the node appears dead to the mesh without losing WiFi.
+   * Exposed via a template switch in both tracker YAMLs (diagnostic). */
+  bool test_offline_{false};
 
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
@@ -632,6 +648,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
      * WiFi up), then prune stale peers_ entries (60 s / PEER_STALE_MS threshold).
      * Wind primary is auto-elected: see am_i_wind_primary_(). */
     this->set_interval("mesh_broadcasts", 5000, [this]() {
+      if (test_offline_) return;
       this->mesh_tx_telemetry_();
       if (this->am_i_wind_primary_()) this->mesh_tx_wind_();
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
@@ -652,6 +669,7 @@ class TrackerBridge : public Component, public uart::UARTDevice {
      *   handle_payload_ → publish_state on local slider + broadcast GET_RESP
      *   so any other gateway node also sees the current value. */
     this->set_interval("cfg_poll", 30000, [this]() {
+      if (test_offline_) return;
       /* --- Remote peers (acting gateway only) --- */
       if (this->is_acting_gateway_()) {
         for (const auto &kv : this->peer_decls_) {

@@ -1,0 +1,19 @@
+# Bench-test harness configuration.
+#
+# Copy this file to bench_test_config.yaml, fill in real values, and run:
+#   python tools/bench_test.py --all
+#
+# bench_test_config.yaml is gitignored; this .example is checked in.
+
+nodes:
+  solar-tracker-1:
+    host: 192.168.1.193
+    api_key: "your-base64-encryption-key-here"
+  solar-tracker-2:
+    host: 192.168.1.194
+    api_key: "your-base64-encryption-key-here"
+
+# storm_dwell_test_value: value (minutes) to temporarily set storm_dwell_min
+# to during force-park tests.  Lower = faster test.  Restored at end of test.
+# Range: 1–60.  Default: 1 (the minimum allowed by the STC firmware).
+storm_dwell_test_value: 1
