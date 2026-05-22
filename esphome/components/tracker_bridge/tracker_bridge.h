@@ -189,8 +189,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   void set_mesh_channel(uint8_t ch) { mesh_channel_ = ch; mesh_enabled_ = true; }
   void set_mesh_psk(const std::string &psk) { mesh_psk_ = psk; }
   void set_test_broadcast(bool v) { test_broadcast_ = v; }
-  /* local_role: 1 = primary (owns wind sensor), 2 = secondary */
-  void set_local_role(uint8_t r) { local_role_ = r; }
+  /* P6-1: has_wind_sensor capability bit -- true if this node has a real
+   * wind sensor (attached to the STC).  Election: the live has_wind_sensor
+   * peer with the lowest MAC becomes the wind primary and broadcasts WIND
+   * frames.  Set from YAML mesh.has_wind_sensor:; defaults to false. */
+  void set_has_wind_sensor(bool v) { has_wind_sensor_ = v; }
 
   /* Bench-helper write path for the wind cache.  Used by the optional
    * WindOverrideNumber to inject synthetic wind values on a node with
@@ -235,15 +238,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (mesh_enabled_) {
       mesh_setup_();
     }
-
-    /* P5-7: pull STC role from EEPROM ~3 s after boot.
-     * If the STC is present it replies with "cfg id=32 val=V" which
-     * handle_payload_ catches and uses to overwrite local_role_.
-     * On no-STC nodes (bench helper, tracker-2) no reply arrives and
-     * the YAML mesh.local_role: default stays in effect — no action needed. */
-    this->set_timeout("cfg_role_initial", 3000, [this]() {
-      this->write_str_frame_("!cfg get id=32");
-    });
 
     if (mesh_enabled_ && test_broadcast_) {
       /* Bench validation: broadcast a 2-byte test packet every 5 s.
@@ -377,8 +371,12 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         if (key == "id")       cfg_id  = std::atoi(val.c_str());
         else if (key == "val") cfg_val = std::atoi(val.c_str());
       }
-      /* Accept fields 1-4 (config sliders) and 32 (CFG_F_ROLE = 0x20). */
-      bool known_field = (cfg_id >= 1 && cfg_id <= 4) || (cfg_id == 32);
+      /* Accept fields 1-4 (config sliders).
+       * Field 32 (CFG_F_ROLE) is no longer used by the ESP side: wind primary
+       * is determined by the has_wind_sensor capability bit (P6-1).
+       * The STC's role EEPROM byte still controls STC-side wind_source behavior;
+       * the ESP simply ignores field-32 replies from this firmware version on. */
+      bool known_field = (cfg_id >= 1 && cfg_id <= 4);
       if (!known_field || cfg_val < 0) {
         ESP_LOGD(TAG, "cfg reply ignored: id=%d val=%d", cfg_id, cfg_val);
         return;
@@ -386,27 +384,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       uint8_t fid = (uint8_t)cfg_id;
       uint8_t fval = (uint8_t)(cfg_val > 255 ? 255 : cfg_val);
       ESP_LOGD(TAG, "cfg reply: fid=%u val=%u", (unsigned)fid, (unsigned)fval);
-
-      /* P5-7: CFG_F_ROLE (id=32 / 0x20): STC EEPROM is authoritative source
-       * of truth for local_role_.  Overwrite on first valid reply; log once. */
-      if (fid == 32) {
-        if (fval == ROLE_PRIMARY || fval == ROLE_SECONDARY) {
-          if (!role_from_stc_received_) {
-            role_from_stc_received_ = true;
-            local_role_ = fval;
-            ESP_LOGI(TAG, "STC role synced: %u (%s)", (unsigned)local_role_,
-                     local_role_ == ROLE_PRIMARY ? "primary" : "secondary");
-          } else if (local_role_ != fval) {
-            /* Subsequent poll detected an operator change via LCD menu. */
-            local_role_ = fval;
-            ESP_LOGI(TAG, "STC role updated: %u (%s)", (unsigned)local_role_,
-                     local_role_ == ROLE_PRIMARY ? "primary" : "secondary");
-          }
-        } else {
-          ESP_LOGW(TAG, "STC role reply out of range: %u (ignored)", (unsigned)fval);
-        }
-        return;
-      }
 
       /* Fields 1-4: publish to the local slider (if wired). */
 #ifdef USE_NUMBER
@@ -495,11 +472,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   static constexpr uint8_t MSG_COMMAND    = 4;
   static constexpr uint8_t MSG_CONFIG     = 5;
 
-  /* Role constants: primary owns the wind sensor and broadcasts WIND packets;
-   * secondary nodes receive WIND from the primary and forward to their STC. */
-  static constexpr uint8_t ROLE_PRIMARY   = 1;
-  static constexpr uint8_t ROLE_SECONDARY = 2;
-
   /* --- Command codes (MSG_COMMAND payload byte 6) --- */
   static constexpr uint8_t CMD_FORCE_PARK    = 1;
   static constexpr uint8_t CMD_FORCE_RELEASE = 2;
@@ -523,15 +495,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * responded.  Used by WindOverrideNumber to warn when the bench-helper
    * slider is moved on an STC-equipped node. */
   uint32_t last_stc_reply_ms_{0};
-  /* ROLE_PRIMARY or ROLE_SECONDARY.
-   * Bootstrap default comes from YAML's mesh.local_role: (set via set_local_role() at codegen).
-   * P5-7: on boot, setup() fires a one-shot "!cfg get id=32" (CFG_F_ROLE=0x20).  When the STC
-   * replies with "cfg id=32 val=V", handle_payload_ overwrites this member with the authoritative
-   * EEPROM value and sets role_from_stc_received_=true.  On no-STC nodes (e.g. tracker-2 bench
-   * helper), no reply arrives and the YAML default remains in effect. */
-  uint8_t local_role_{ROLE_SECONDARY};
-  /* True after the first authoritative STC role reply is received (P5-7). */
-  bool role_from_stc_received_{false};
+  /* P6-1: capability bit set from YAML mesh.has_wind_sensor:.
+   * True iff this node has a real wind sensor attached to the STC.
+   * The wind primary is auto-elected: the live has_wind_sensor peer with
+   * the lowest MAC becomes the broadcaster.  Defaults to false. */
+  bool has_wind_sensor_{false};
 
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
@@ -586,6 +554,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     uint8_t az_pct{0}, el_pct{0}, wind_used{0};
     std::string mode{};
     uint8_t mac[6]{};             /* last-seen source MAC for this peer (unicast targeting) */
+    /* P6-1: capability bit from flags byte of TELEMETRY payload. */
+    bool has_wind_sensor{false};
   };
   std::map<std::array<char, 32>, PeerEntry> peers_;
 
@@ -654,14 +624,16 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     /* Register broadcast peer (FF:FF:FF:FF:FF:FF). */
     uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     esp_now_add_peer(bcast, ESP_NOW_ROLE_SLAVE, mesh_channel_, NULL, 0);
-    ESP_LOGI(TAG, "Mesh enabled: channel=%u name=%s epoch=%u role=%u",
-             mesh_channel_, wire_id_, (unsigned)boot_epoch_, (unsigned)local_role_);
+    ESP_LOGI(TAG, "Mesh enabled: channel=%u name=%s epoch=%u has_wind_sensor=%s",
+             mesh_channel_, wire_id_, (unsigned)boot_epoch_,
+             has_wind_sensor_ ? "yes" : "no");
 
-    /* Every 5 s: TELEMETRY (always), WIND (if primary), GATEWAY_HB (if WiFi up),
-     * then prune stale peers_ entries (60 s / PEER_STALE_MS threshold). */
+    /* Every 5 s: TELEMETRY (always), WIND (if elected primary), GATEWAY_HB (if
+     * WiFi up), then prune stale peers_ entries (60 s / PEER_STALE_MS threshold).
+     * Wind primary is auto-elected: see am_i_wind_primary_(). */
     this->set_interval("mesh_broadcasts", 5000, [this]() {
       this->mesh_tx_telemetry_();
-      if (this->local_role_ == ROLE_PRIMARY) this->mesh_tx_wind_();
+      if (this->am_i_wind_primary_()) this->mesh_tx_wind_();
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
       this->peers_prune_();
     });
@@ -698,10 +670,8 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       }
       /* --- Local STC (always, regardless of gateway role) ---
        * The STC reply flows through handle_payload_ which publishes the
-       * local slider and, if mesh is up, broadcasts GET_RESP for peers.
-       * Field 32 (CFG_F_ROLE) is also polled so that an operator change
-       * via the LCD Settings menu is picked up within one poll cycle. */
-      for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4, (uint8_t)32}) {
+       * local slider and, if mesh is up, broadcasts GET_RESP for peers. */
+      for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4}) {
         char buf[20];
         int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", (unsigned)fid);
         if (sn > 0 && (size_t)sn < sizeof(buf)) this->write_str_frame_(buf);
@@ -870,12 +840,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         /* Self-echo guard (consistency with TELEMETRY/GATEWAY_HB): a node's
          * own ESP-NOW broadcast loops back on ROLE_COMBO. */
         if (std::memcmp(name_key.data(), wire_id_, 32) == 0) break;
-        /* The primary owns the wind sensor; don't apply another primary's
-         * reading to our STC even in a rare dual-primary deployment. */
-        if (local_role_ == ROLE_PRIMARY) break;
+        /* P6-1: elected wind primary doesn't apply someone else's WIND to
+         * its own STC.  In a well-formed mesh the lowest-MAC wind-sensor node
+         * is the only broadcaster so this rarely fires, but it's a hard guard
+         * for the odd dual-sensor edge case. */
+        if (am_i_wind_primary_()) break;
         /* Forward wind value to local STC via the !wind=NN framed command.
-         * Secondary nodes relay primary's wind reading to their STC so the
-         * STC's own storm_check can trip without a local wind sensor. */
+         * Nodes without a local wind sensor relay the elected primary's
+         * reading to their STC so the STC's own storm_check can trip. */
         {
           char buf[16];
           int sn = snprintf(buf, sizeof(buf), "!wind=%u", (unsigned)p[0]);
@@ -895,13 +867,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         break;
       }
       case MSG_TELEMETRY: {
-        if (plen < 4) return;
+        if (plen < 5) return;
         /* Drop self-echo by node_name comparison. */
         if (std::memcmp(name_key.data(), wire_id_, 32) == 0) break;
         auto &e = peers_[name_key];
         e.last_telemetry_ms = millis();
         e.az_pct = p[0]; e.el_pct = p[1]; e.wind_used = p[2];
         e.mode = mode_from_code_(p[3]);
+        /* P6-1: flags byte -- bit 0 = has_wind_sensor capability. */
+        e.has_wind_sensor = (p[4] & 0x01) != 0;
         memcpy(e.mac, src, 6);
         /* If we're the acting gateway, publish to HA for this peer */
         if (is_acting_gateway_()) publish_peer_to_ha_(name_key, e);
@@ -1033,13 +1007,16 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   /* ---- Periodic mesh broadcast helpers (Task 8) ---- */
 
   void mesh_tx_telemetry_() {
-    uint8_t p[4] = {
+    /* P6-1: flags byte -- bit 0 = has_wind_sensor capability.
+     * Bits 1-7 reserved for future capability bits. */
+    uint8_t flags = has_wind_sensor_ ? 0x01 : 0x00;
+    uint8_t p[5] = {
       local_az_pct_, local_el_pct_, local_wind_used_,
-      mode_to_code_(local_mode_)
+      mode_to_code_(local_mode_), flags
     };
-    mesh_tx_(MSG_TELEMETRY, p, 4);
-    ESP_LOGD(TAG, "tx TELEMETRY az=%u el=%u wind=%u mode=%u role=%u",
-             p[0], p[1], p[2], p[3], (unsigned) local_role_);
+    mesh_tx_(MSG_TELEMETRY, p, 5);
+    ESP_LOGD(TAG, "tx TELEMETRY az=%u el=%u wind=%u mode=%u flags=0x%02X",
+             p[0], p[1], p[2], p[3], (unsigned)flags);
   }
 
   void mesh_tx_wind_() {
@@ -1103,6 +1080,27 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       case 9: return "ver";
       default: return "?";
     }
+  }
+
+  /* Wind-primary election (P6-1): returns true iff this node has a wind
+   * sensor AND has the lowest MAC among all currently-alive peers that
+   * also have has_wind_sensor set.  "Alive" means a TELEMETRY was seen
+   * within PEER_STALE_MS (60 s).  Mirrors is_acting_gateway_() pattern.
+   *
+   * Semantics: lowest MAC wins so the election is stable and deterministic.
+   * If only one node has has_wind_sensor_, it is always primary regardless
+   * of MAC value.  If no node has it, no WIND is broadcast. */
+  bool am_i_wind_primary_() {
+    if (!has_wind_sensor_) return false;
+    uint32_t now = millis();
+    for (const auto &kv : peers_) {
+      if (!kv.second.has_wind_sensor) continue;
+      if ((now - kv.second.last_telemetry_ms) > PEER_STALE_MS) continue;
+      /* A live peer with a wind sensor -- if its MAC is lower than ours,
+       * we are not the primary. */
+      if (std::memcmp(kv.second.mac, my_mac_, 6) < 0) return false;
+    }
+    return true;
   }
 
   /* Gateway election: returns true iff this node has the lowest MAC among

@@ -4,10 +4,21 @@
 # except for device name, static IP, and tracker_id.  The mesh channel
 # and PSK must match tracker-1's values exactly.
 #
+# P6-1: no_wind_sensor role -- tracker-2 has no physical wind sensor.
+# It does NOT set has_wind_sensor: true, so it is never elected wind
+# primary.  Wind readings arrive via WIND mesh frames from tracker-1.
+#
+# BENCH NOTE: the wind_override slider below can still inject synthetic
+# wind values into this node's local STC (if one is connected), but its
+# WIND broadcast path is now gated by the auto-election: since
+# has_wind_sensor is false here, mesh_tx_wind_() is never called and the
+# slider's value does NOT propagate to other nodes.  If you need to test
+# the full WIND broadcast path on the bench without a real sensor,
+# temporarily set has_wind_sensor: true on this node to force election.
+#
 # To validate ESP-NOW: flash this to a spare ESP-01S, power both nodes,
-# and watch the ESPHome logs.  With MESH_TEST_BROADCAST=1 (set at
-# compile time in tracker_bridge.h) you should see:
-#   tracker-1 log: "test broadcast sent (MESH_TEST_BROADCAST=1)"
+# and watch the ESPHome logs.  With test_broadcast: true you should see:
+#   tracker-1 log: "test broadcast sent"
 #   tracker-2 log: "mesh rx type=99 from XX:XX:XX:XX:XX:XX plen=2"
 # and vice-versa.  If you see "AES auth fail", the PSKs differ.
 
@@ -87,7 +98,7 @@ tracker_bridge:
   mesh:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
-    local_role: primary    # bench test: synthetic primary, broadcasts WIND from wind_override slider
+    has_wind_sensor: false  # P6-1: no sensor here; never elected wind primary
     peers:
       - solar-tracker-1   # node_name of the peer (esphome.name in that node's YAML)
 
