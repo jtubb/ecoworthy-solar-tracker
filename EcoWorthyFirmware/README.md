@@ -85,7 +85,7 @@ fight the USB-TTL adapter on the shared wire. This is why fast power-cycling
 and an immediately-ready stcgal matter: miss the bootloader window and the
 contention starts.
 
-## What the firmware does (Phases 0–3)
+## What the firmware does (Phases 0–4)
 
 `main.c` boots relay-safe (all relays + buzzer forced LOW), configures
 ports, inits the HD44780 LCD, starts a 1 kHz Timer 0 `millis()` tick,
@@ -124,8 +124,93 @@ payload bytes. The ESP polls `?` every 2 s; the STC replies with
 `az=NN el=NN wind=NN mode=XXX`. The ESP-side custom component
 (`tracker_bridge`, at `<repo>/esphome/components/`) parses the same
 framing and publishes the four fields to Home Assistant. Reference
-YAML at `esphome/solar-tracker-1.yaml`. Read-only in v1 — HA→STC
-commands are deferred to a future phase.
+YAMLs at `esphome/solar-tracker-{1,2}.yaml`. Phase 4 extends the
+bridge with bidirectional commands (HA → STC) and the ESP-NOW mesh
+(see below).
+
+### Phase 4: multi-tracker ESP-NOW mesh
+
+Multiple `solar-tracker-N` nodes form a peer-to-peer mesh over ESP-NOW on
+a shared channel (`mesh.channel:` in the YAML, must equal the WiFi AP
+channel). All traffic is encrypted with AES-128-GCM; the key is derived as
+SHA-256(`tracker_mesh_psk`) truncated to 16 bytes. Every node must share
+the same PSK.
+
+**Roles** — set via `local_role:` in the `mesh:` sub-block:
+
+- `primary` — owns the physical wind sensor. Broadcasts WIND packets every
+  5 s. Secondary nodes that have no local wind sensor use this reading.
+- `secondary` (default) — receives WIND from the primary and forwards
+  `!wind=NN` to its local STC over the UART bridge.
+
+**Message types** broadcast every 5 s unless noted:
+
+| Code | Name | Sender | Payload |
+|------|------|--------|---------|
+| 1 | WIND | primary only | `wind_mps(1)` `flags(1)` (bit 0 = storm) |
+| 2 | TELEMETRY | every node | `az_pct(1)` `el_pct(1)` `wind_used(1)` `mode(1)` |
+| 3 | GATEWAY_HB | every WiFi-up node | `rssi(int8)` |
+| 4 | COMMAND | acting gateway | `target_mac(6)` `cmd(1)` `arg1(1)` `arg2(1)` |
+| 5 | CONFIG | acting gateway / peer | `op(1)` `field_id(1)` `[val(1+)]` |
+
+**Packet format** — 45-byte AAD-covered header followed by AES-128-GCM
+ciphertext + 8-byte tag:
+
+```
+header:  type(1) src_mac(6) epoch(2) ctr(4) node_name(32)
+nonce:   src_mac(6) || epoch(2) || ctr(4)   [12 bytes, per RFC 5116]
+```
+
+The `epoch` is a 16-bit counter persisted to flash and incremented on every
+boot. The replay filter accepts a packet only when `(epoch, ctr)` is
+strictly greater than the last accepted `(epoch, ctr)` for that
+`node_name`.
+
+**Acting gateway** — the lowest-MAC node among declared `peers:` that has
+sent a GATEWAY_HB within the last 15 s. Only the acting gateway calls into
+HA to publish per-peer telemetry, preventing duplicate entity updates.
+
+**Per-peer HA entities** — each peer listed in `peers:` gets its own
+`sensor:`, `text_sensor:`, and `number:` blocks keyed by
+`peer_id: <esphome.name>`. The acting gateway populates them from received
+TELEMETRY packets. RW config sliders with a `peer_id:` send a CONFIG
+SET_REQ over ESP-NOW to the target node.
+
+**Command surface** (exposed as ESPHome `button:` entities, broadcast to
+all trackers):
+
+| Button | Effect on STC |
+|--------|---------------|
+| `force_park` | Sets `storm_forced`; parks to horizontal and holds |
+| `force_release` | Clears `storm_forced`; returns to tracking after dwell |
+| `stop` | Halts motion immediately |
+
+**YAML schema** — `mesh:` sub-block under `tracker_bridge:`:
+
+```yaml
+tracker_bridge:
+  mesh:
+    channel: 6          # integer 1-13; must match the WiFi AP channel
+    psk: !secret tracker_mesh_psk   # string >= 16 chars
+    local_role: primary             # "primary" or "secondary" (default)
+    test_broadcast: false           # set true to emit type=99 every 5s for bench validation
+    peers:
+      - solar-tracker-2             # list of esphome.name of known mesh peers
+```
+
+**Storm semantics on the STC** — two independent flags:
+
+- `storm_forced` — operator-asserted via `!park` command; sticky until
+  `!release`. Set/cleared by the acting gateway's `force_park` /
+  `force_release` button presses propagated over ESP-NOW COMMAND packets.
+- `wind_failsafe` — auto-managed: set when `wind_source=1` (remote) and no
+  WIND broadcast has arrived for 20 s; cleared when fresh broadcasts resume.
+
+**ESPHome dashboard vs. repo YAMLs** — the YAMLs in `EcoWorthyFirmware/esphome/`
+are the reference copy maintained in the repo. The operational YAMLs live
+inside the ESPHome dashboard's docker container. Sync repo → dashboard
+manually after edits, or bind-mount the repo directory as the dashboard's
+config directory to keep them in sync automatically.
 
 ## Debugging notes
 
