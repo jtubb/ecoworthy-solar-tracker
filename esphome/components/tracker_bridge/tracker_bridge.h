@@ -219,9 +219,29 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   }
 
   /* HA->mesh broadcast methods (callable from buttons/numbers) */
-  void broadcast_force_park()    { mesh_tx_command_(broadcast_mac_(), CMD_FORCE_PARK,    0, 0); }
-  void broadcast_force_release() { mesh_tx_command_(broadcast_mac_(), CMD_FORCE_RELEASE, 0, 0); }
-  void broadcast_stop()          { mesh_tx_command_(broadcast_mac_(), CMD_STOP,          0, 0); }
+  /* Broadcast a command to all peers AND execute it locally on this node's
+   * own STC.  ESP-NOW broadcasts do NOT reliably loop back to the sender on
+   * ESP8266 ROLE_COMBO, so the local STC would otherwise miss its own
+   * operator-initiated commands.  Direct local UART write + mesh broadcast
+   * gives every node (including self) the !park / !release / !stop frame.
+   * test_offline_ gates BOTH paths so simulated-offline nodes are silent.
+   * If self-loopback DOES happen on some SDK builds, the duplicate frame
+   * is idempotent (storm_forced=1 stays 1). */
+  void broadcast_force_park() {
+    if (test_offline_) return;
+    mesh_tx_command_(broadcast_mac_(), CMD_FORCE_PARK, 0, 0);
+    write_str_frame_("!park");
+  }
+  void broadcast_force_release() {
+    if (test_offline_) return;
+    mesh_tx_command_(broadcast_mac_(), CMD_FORCE_RELEASE, 0, 0);
+    write_str_frame_("!release");
+  }
+  void broadcast_stop() {
+    if (test_offline_) return;
+    mesh_tx_command_(broadcast_mac_(), CMD_STOP, 0, 0);
+    write_str_frame_("!stop");
+  }
   void send_goto(const uint8_t target[6], uint8_t az, uint8_t el)            { mesh_tx_command_(target, CMD_GOTO,      az,     el); }
   void send_jog(const uint8_t target[6], uint8_t ax_dir, uint8_t dur_100ms) { mesh_tx_command_(target, CMD_JOG,       ax_dir, dur_100ms); }
   void send_calibrate(const uint8_t target[6])                               { mesh_tx_command_(target, CMD_CALIBRATE, 0,      0); }
