@@ -228,6 +228,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       mesh_setup_();
     }
 
+    /* P5-7: pull STC role from EEPROM ~3 s after boot.
+     * If the STC is present it replies with "cfg id=32 val=V" which
+     * handle_payload_ catches and uses to overwrite local_role_.
+     * On no-STC nodes (bench helper, tracker-2) no reply arrives and
+     * the YAML mesh.local_role: default stays in effect — no action needed. */
+    this->set_timeout("cfg_role_initial", 3000, [this]() {
+      this->write_str_frame_("!cfg get id=32");
+    });
+
     if (mesh_enabled_ && test_broadcast_) {
       /* Bench validation: broadcast a 2-byte test packet every 5 s.
        * Periodic (not one-shot) so a slow WiFi/channel settle doesn't
@@ -360,14 +369,38 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         if (key == "id")       cfg_id  = std::atoi(val.c_str());
         else if (key == "val") cfg_val = std::atoi(val.c_str());
       }
-      if (cfg_id < 1 || cfg_id > 4 || cfg_val < 0) {
+      /* Accept fields 1-4 (config sliders) and 32 (CFG_F_ROLE = 0x20). */
+      bool known_field = (cfg_id >= 1 && cfg_id <= 4) || (cfg_id == 32);
+      if (!known_field || cfg_val < 0) {
         ESP_LOGD(TAG, "cfg reply ignored: id=%d val=%d", cfg_id, cfg_val);
         return;
       }
       uint8_t fid = (uint8_t)cfg_id;
       uint8_t fval = (uint8_t)(cfg_val > 255 ? 255 : cfg_val);
       ESP_LOGD(TAG, "cfg reply: fid=%u val=%u", (unsigned)fid, (unsigned)fval);
-      /* Publish to the local slider (if wired). */
+
+      /* P5-7: CFG_F_ROLE (id=32 / 0x20): STC EEPROM is authoritative source
+       * of truth for local_role_.  Overwrite on first valid reply; log once. */
+      if (fid == 32) {
+        if (fval == ROLE_PRIMARY || fval == ROLE_SECONDARY) {
+          if (!role_from_stc_received_) {
+            role_from_stc_received_ = true;
+            local_role_ = fval;
+            ESP_LOGI(TAG, "STC role synced: %u (%s)", (unsigned)local_role_,
+                     local_role_ == ROLE_PRIMARY ? "primary" : "secondary");
+          } else if (local_role_ != fval) {
+            /* Subsequent poll detected an operator change via LCD menu. */
+            local_role_ = fval;
+            ESP_LOGI(TAG, "STC role updated: %u (%s)", (unsigned)local_role_,
+                     local_role_ == ROLE_PRIMARY ? "primary" : "secondary");
+          }
+        } else {
+          ESP_LOGW(TAG, "STC role reply out of range: %u (ignored)", (unsigned)fval);
+        }
+        return;
+      }
+
+      /* Fields 1-4: publish to the local slider (if wired). */
 #ifdef USE_NUMBER
       {
         number::Number *local_num = nullptr;
@@ -474,8 +507,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   uint8_t local_el_pct_{0};
   uint8_t local_wind_used_{0};
   std::string local_mode_{};
-  /* ROLE_PRIMARY or ROLE_SECONDARY (default secondary until set via YAML) */
+  /* ROLE_PRIMARY or ROLE_SECONDARY.
+   * Bootstrap default comes from YAML's mesh.local_role: (set via set_local_role() at codegen).
+   * P5-7: on boot, setup() fires a one-shot "!cfg get id=32" (CFG_F_ROLE=0x20).  When the STC
+   * replies with "cfg id=32 val=V", handle_payload_ overwrites this member with the authoritative
+   * EEPROM value and sets role_from_stc_received_=true.  On no-STC nodes (e.g. tracker-2 bench
+   * helper), no reply arrives and the YAML default remains in effect. */
   uint8_t local_role_{ROLE_SECONDARY};
+  /* True after the first authoritative STC role reply is received (P5-7). */
+  bool role_from_stc_received_{false};
 
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
@@ -642,8 +682,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       }
       /* --- Local STC (always, regardless of gateway role) ---
        * The STC reply flows through handle_payload_ which publishes the
-       * local slider and, if mesh is up, broadcasts GET_RESP for peers. */
-      for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4}) {
+       * local slider and, if mesh is up, broadcasts GET_RESP for peers.
+       * Field 32 (CFG_F_ROLE) is also polled so that an operator change
+       * via the LCD Settings menu is picked up within one poll cycle. */
+      for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4, (uint8_t)32}) {
         char buf[20];
         int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", (unsigned)fid);
         if (sn > 0 && (size_t)sn < sizeof(buf)) this->write_str_frame_(buf);
