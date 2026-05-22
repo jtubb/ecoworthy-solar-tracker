@@ -517,6 +517,13 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * Exposed via a template switch in both tracker YAMLs (diagnostic). */
   bool test_offline_{false};
 
+  /* P6-2: last election outcome we synced to the STC's CFG_F_WIND_SOURCE
+   * (EEPROM byte 13).  -1 = not yet evaluated; 0 = pushed primary (WSrc=0);
+   * 1 = pushed secondary (WSrc=1).  When the election outcome changes,
+   * sync_stc_wsrc_to_election_() pushes "!cfg set id=33 val=N" to the STC
+   * so the STC's storm_check picks the right source automatically. */
+  int8_t last_primary_state_{-1};
+
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
   std::string mesh_psk_{};
@@ -650,9 +657,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     this->set_interval("mesh_broadcasts", 5000, [this]() {
       if (test_offline_) return;
       this->mesh_tx_telemetry_();
-      if (this->am_i_wind_primary_()) this->mesh_tx_wind_();
+      bool primary_now = this->am_i_wind_primary_();
+      if (primary_now) this->mesh_tx_wind_();
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
       this->peers_prune_();
+      this->sync_stc_wsrc_to_election_(primary_now);
     });
 
     /* Every 30 s: acting gateway polls each declared remote peer for its 4
@@ -1119,6 +1128,28 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       if (std::memcmp(kv.second.mac, my_mac_, 6) < 0) return false;
     }
     return true;
+  }
+
+  /* P6-2: auto-sync STC's wind_source EEPROM byte to match election outcome.
+   * Primary owns a wind sensor -> WSrc=0 (STC uses local ADC reading).
+   * Secondary listens for mesh WIND broadcasts -> WSrc=1 (STC uses
+   * remote_wind_mps cache, arms wind_failsafe if broadcasts go silent).
+   *
+   * Eliminates the F7 misconfiguration trap where an operator declares
+   * has_wind_sensor: true but leaves the STC's WSrc=1 from earlier
+   * bench-testing -- the node would broadcast WIND to itself, drop the
+   * self-echo, never update remote_wind_mps, and wind_failsafe would
+   * arm forever. */
+  void sync_stc_wsrc_to_election_(bool primary_now) {
+    int8_t target = primary_now ? 0 : 1;
+    if (last_primary_state_ == target) return;
+    char buf[24];
+    int sn = snprintf(buf, sizeof(buf), "!cfg set id=33 val=%d", target);
+    if (sn <= 0 || (size_t) sn >= sizeof(buf)) return;
+    write_str_frame_(buf);
+    ESP_LOGI(TAG, "election: primary=%s -> pushing STC WSrc=%d",
+             primary_now ? "yes" : "no", target);
+    last_primary_state_ = target;
   }
 
   /* Gateway election: returns true iff this node has the lowest MAC among
