@@ -184,6 +184,49 @@ all trackers):
 | `force_park` | Sets `storm_forced`; parks to horizontal and holds |
 | `force_release` | Clears `storm_forced`; returns to tracking after dwell |
 | `stop` | Halts motion immediately |
+| `calibrate` | Triggers a full stall-to-stall calibration run |
+
+`calibrate` accepts an optional `peer_id` to unicast to one tracker; omit `peer_id` to
+broadcast to all trackers.  `force_park`, `force_release`, and `stop` are broadcast-only.
+
+#### HA goto / jog actions via lambda
+
+`send_goto(target, az, el)` and `send_jog(target, ax_dir, dur_100ms)` take binary
+arguments that don't map cleanly to a button entity (they need numeric parameters).
+Use a `script:` block and a `lambda:` action to call them from HA automations:
+
+```yaml
+script:
+  # Move a specific tracker to the horizontal (parked) position by percentage.
+  - id: t2_goto_horizontal
+    then:
+      - lambda: |-
+          auto *b = id(bridge);
+          // Replace with the actual MAC from tracker-2's ESPHome log on first boot.
+          uint8_t target[6] = {0xEC, 0xFA, 0xBC, 0x00, 0x00, 0x02};
+          b->send_goto(target, 50, 50);   // 50% az, 50% el = horizontal
+
+  # Broadcast goto to every tracker (all bytes 0xFF).
+  - id: all_goto_horizontal
+    then:
+      - lambda: |-
+          auto *b = id(bridge);
+          uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+          b->send_goto(bcast, 50, 50);
+
+  # Jog tracker-2's N/S axis toward North for 2 s (20 × 100 ms).
+  # ax_dir encoding: bit 7 = axis (0=N/S, 1=E/W), bit 0 = dir (1=+, 0=−).
+  - id: t2_jog_ns_north_2s
+    then:
+      - lambda: |-
+          auto *b = id(bridge);
+          uint8_t target[6] = {0xEC, 0xFA, 0xBC, 0x00, 0x00, 0x02};
+          b->send_jog(target, 0x01, 20);  // axis=0 (N/S), dir=+ (North), 2 s
+```
+
+`az` and `el` are 0–100 (percentage of calibrated stroke).  `ax_dir` packs axis and
+direction into one byte: bits 7..1 = axis (0 = N/S, 1 = E/W), bit 0 = direction
+(1 = extend/+, 0 = retract/−).  `dur_100ms` is duration in units of 100 ms (1–255).
 
 **YAML schema** — `mesh:` sub-block under `tracker_bridge:`:
 

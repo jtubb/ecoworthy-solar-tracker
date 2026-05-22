@@ -206,6 +206,17 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   void send_jog(const uint8_t target[6], uint8_t ax_dir, uint8_t dur_100ms) { mesh_tx_command_(target, CMD_JOG,       ax_dir, dur_100ms); }
   void send_calibrate(const uint8_t target[6])                               { mesh_tx_command_(target, CMD_CALIBRATE, 0,      0); }
 
+  /* Public accessor for button subclasses: look up a peer's last-seen MAC by
+   * node_name.  Returns nullptr if the peer has never broadcast on the mesh. */
+  const uint8_t *find_peer_mac_for_button_(const std::string &peer_name) {
+    auto key = make_name_key_(peer_name);
+    auto it = peers_.find(key);
+    if (it != peers_.end()) return it->second.mac;
+    ESP_LOGW(TAG, "find_peer_mac_for_button_: peer '%s' not yet seen on mesh",
+             peer_name.c_str());
+    return nullptr;
+  }
+
   void setup() override {
     /* Poll the STC every 2 s.  ESPHome's set_interval handles timing
      * and survives WiFi/HA disconnects -- the bridge keeps polling
@@ -1253,6 +1264,35 @@ class StopButton : public button::Button {
  protected:
   void press_action() override { if (parent_) parent_->broadcast_stop(); }
   TrackerBridge *parent_{nullptr};
+};
+
+/* Per-peer calibrate button.  Optional peer_id: if set, unicasts
+ * CMD_CALIBRATE to the named peer's last-seen MAC.  If peer_id is
+ * empty (or the button is declared without a peer_id), broadcasts
+ * to all trackers — consistent with force_park / stop behaviour. */
+class CalibrateButton : public button::Button {
+ public:
+  void set_parent(TrackerBridge *p) { parent_ = p; }
+  void set_peer_id(const std::string &id) { peer_id_ = id; }
+ protected:
+  void press_action() override {
+    if (parent_ == nullptr) return;
+    if (peer_id_.empty()) {
+      /* No peer specified: broadcast calibrate to all trackers. */
+      uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+      parent_->send_calibrate(bcast);
+    } else {
+      const uint8_t *target = parent_->find_peer_mac_for_button_(peer_id_);
+      if (!target) {
+        ESP_LOGW(TAG, "CalibrateButton: peer '%s' not in peers_ map (never broadcast?)",
+                 peer_id_.c_str());
+        return;
+      }
+      parent_->send_calibrate(target);
+    }
+  }
+  TrackerBridge *parent_{nullptr};
+  std::string peer_id_{};
 };
 #endif
 
