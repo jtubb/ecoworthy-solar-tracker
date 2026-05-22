@@ -28,6 +28,7 @@ rweather/Crypto + AES-128-GCM (ESP).
 | P5-7 | STC role sync from EEPROM → ESP YAML | Med | Med | Med | Eliminates `local_role:` YAML duplication |
 | P5-9 | Wind override slider gated by `local_role` | Low | Trivial | Low | Hides bench-helper from STC-equipped nodes |
 | P5-10 | Schema validate `esphome.name <= 31 chars` at codegen | Low | Low | Low | Catch the truncation case before runtime warn |
+| P5-11 | Stagger cfg_poll burst to avoid half-duplex collision | Med | Trivial | Low | One of four cfg reads is dropped each 30 s cycle |
 
 (P5-8 — ESPHome dashboard bind-mount workflow doc — was dropped from scope.)
 
@@ -478,4 +479,70 @@ bool am_i_wind_primary_() {
 - [ ] **Step 9: Bench-validate** — flash both, confirm tracker-1 elects itself as primary (broadcasts WIND), tracker-2 doesn't broadcast WIND but its `wind_override` slider still works for the bench-helper case. Power off tracker-1: tracker-2 stays silent (no auto-promotion since it has no sensor). Power tracker-1 back on: WIND resumes within 5s.
 
 - [ ] **Step 10: Commit**: `feat(esp): P6-1 -- auto-elect wind primary via has_wind_sensor capability bit`
+
+---
+
+## Task P5-11: Stagger cfg_poll burst to avoid half-duplex collision
+
+**Files:**
+- Modify: `esphome/components/tracker_bridge/tracker_bridge.h` (the `cfg_poll` set_interval lambda, ~line 706)
+
+**Why:** The 30 s `cfg_poll` lambda fires four `!cfg get id=N` frames back-to-back into the UART TX
+buffer with zero spacing (the `for (uint8_t fid : {1,2,3,4})` loop at ~line 727). On a half-duplex
+single-wire bus the STC starts replying after parsing the first complete frame in its RX, while the
+ESP is still TXing frames 3/4. The collision corrupts one of the four replies (most often id=3 in
+bench logs from 2026-05-22), so one slider's HA state never updates from STC truth on that cycle. A
+later cycle usually recovers it, but the slider can be stale for up to 30 s after a value change
+made via the LCD.
+
+**Approach:** Replace the tight for-loop with four `set_timeout` calls offset by 150 ms each. 150 ms
+is roughly 7× the per-frame airtime at 9600 baud (~22 ms per 21-byte frame including AA 55 prefix +
+CRC + newline), leaving ample headroom for the STC's reply to land cleanly before the next request
+goes out. The `cfg_poll` cadence stays at 30 s; only the *internal* burst becomes spread across
+~600 ms.
+
+**Diagnostic anchor (keep until task ships):** boot log from 2026-05-22 showing the symptom is in
+the conversation history — `cmd->STC: !cfg get id=1..4` all sent at 18:15:28.290–.398, but only
+`cfg id=1 val=17`, `cfg id=2 val=10`, `cfg id=4 val=3` come back. id=3 (storm_dwell) reply is
+absent, and the id=4 reply arrives 111 ms after id=2 — characteristic of the wire clearing after a
+collision.
+
+- [ ] **Step 1: Write a failing test** that asserts all four cfg sliders update within 5 s of boot.
+  Use `tools/bench_test.py` harness. The test should subscribe to the four `number` entities on
+  `solar-tracker-1` (`*_wind_storm`, `*_wind_release`, `*_storm_dwell`, `*_track_thresh`), restart
+  the device via the `Restart` switch, then assert all four publish a non-NaN state within 5 s. Run
+  it and confirm it fails consistently (id=3 / storm_dwell is the usual victim, but it may rotate).
+
+- [ ] **Step 2: Replace the burst with staggered set_timeout calls.** In
+  `esphome/components/tracker_bridge/tracker_bridge.h` ~line 727, change:
+
+  ```cpp
+  for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4}) {
+    char buf[20];
+    int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", (unsigned)fid);
+    if (sn > 0 && (size_t)sn < sizeof(buf)) this->write_str_frame_(buf);
+  }
+  ```
+
+  to:
+
+  ```cpp
+  for (uint8_t i = 0; i < 4; i++) {
+    uint8_t fid = uint8_t(i + 1);
+    this->set_timeout(uint32_t(i) * 150u, [this, fid]() {
+      char buf[20];
+      int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", (unsigned)fid);
+      if (sn > 0 && (size_t)sn < sizeof(buf)) this->write_str_frame_(buf);
+    });
+  }
+  ```
+
+- [ ] **Step 3: Re-run the test from Step 1** and confirm it passes. All four sliders should
+  publish within ~600 ms of the cfg_poll tick firing.
+
+- [ ] **Step 4: Bench-test 30 s cycle stability.** Watch the boot log for two full cfg_poll cycles
+  (~60 s of runtime). Expect to see four `handle_payload_ p='cfg id=N val=V'` lines per cycle, with
+  no missing IDs across multiple consecutive cycles.
+
+- [ ] **Step 5: Commit**: `fix(esp): P5-11 -- stagger cfg_poll burst by 150 ms to avoid half-duplex collision`
 
