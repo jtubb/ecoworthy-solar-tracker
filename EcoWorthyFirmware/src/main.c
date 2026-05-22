@@ -1814,7 +1814,16 @@ static void uart_cmd_dispatch(state_t *state) {
         return;
     }
     if (strncmp(p + 1, "release", 7) == 0 && p[8] == '\0') {
+        /* One-shot operator override.  Clears BOTH flags:
+         *   storm_forced  -- operator-asserted via !park
+         *   wind_failsafe -- auto-armed by storm_check on remote-wind silence
+         * If the failsafe condition still holds (no fresh broadcasts), the
+         * next storm_check cycle (within 1 s) will re-arm wind_failsafe and
+         * the STC re-enters STORM.  So !release is self-correcting: it lets
+         * the operator override a stuck failsafe, but the safety re-fires
+         * immediately if conditions haven't actually changed. */
         storm_forced = 0;
+        wind_failsafe = 0;
         return;
     }
 
