@@ -136,12 +136,17 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       }
       write_str_frame_(buf);
     } else {
-      /* Remote peer: broadcast MSG_CONFIG SET_REQ over the mesh.
-       * v1 is broadcast (target_matches_us_ returns true always); every
-       * receiver self-applies the SET.  Per-peer unicast targeting via
-       * the peer's last-seen MAC is deferred to a future refinement. */
-      uint8_t p[3] = { CFG_OP_SET_REQ, field_id, value };
-      mesh_tx_(MSG_CONFIG, p, 3);
+      /* Remote peer: unicast MSG_CONFIG SET_REQ via mesh.
+       * Payload: op(1) + target_name(32) + field_id(1) + value(1) = 35 bytes.
+       * Receiver compares target_name against its own wire_id_ and silently
+       * drops on mismatch -- only the named peer self-applies the SET. */
+      auto target = make_name_key_(peer_id);
+      uint8_t p[1 + 32 + 1 + 1];
+      p[0] = CFG_OP_SET_REQ;
+      memcpy(p + 1, target.data(), 32);
+      p[33] = field_id;
+      p[34] = value;
+      mesh_tx_(MSG_CONFIG, p, sizeof(p));
       ESP_LOGD(TAG, "config_set peer='%s' fid=%u val=%u", peer_id.c_str(), field_id, value);
     }
   }
@@ -751,44 +756,38 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         break;
       }
       case MSG_CONFIG: {
-        if (plen < 2) return;
-        uint8_t op = p[0], field_id = p[1];
-        switch (op) {
-          case CFG_OP_GET_REQ:
-            /* Reply with our local STC's cached config value.
-             * v1: accept all GET_REQ (target matching refined in Task 11). */
-            if (target_matches_us_(src)) {
-              char buf[20];
-              int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", field_id);
-              if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
-                ESP_LOGE(TAG, "CFG_GET snprintf truncation");
-                break;
-              }
-              write_str_frame_(buf);
-              /* STC reply arrives via UART RX path -> published to HA */
-            }
+        if (plen < 1) return;
+        uint8_t op = p[0];
+        if (op == CFG_OP_SET_REQ) {
+          /* SET_REQ payload: op(1) + target_name(32) + field_id(1) + val(1) = 35 bytes */
+          if (plen < 1 + 32 + 1 + 1) return;
+          /* Reject if target_name doesn't match our wire_id_ */
+          if (memcmp(p + 1, wire_id_, 32) != 0) break;
+          uint8_t field_id = p[33];
+          uint8_t val      = p[34];
+          char buf[32];
+          int sn = snprintf(buf, sizeof(buf), "!cfg set id=%u val=%u", field_id, val);
+          if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+            ESP_LOGE(TAG, "CFG_SET snprintf truncation");
             break;
-          case CFG_OP_SET_REQ:
-            if (target_matches_us_(src) && plen >= 3) {
-              uint8_t val = p[2];   /* u8 fields; u16 needs plen>=4 */
-              char buf[32];
-              int sn = snprintf(buf, sizeof(buf), "!cfg set id=%u val=%u",
-                                field_id, val);
-              if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
-                ESP_LOGE(TAG, "CFG_SET snprintf truncation");
-                break;
-              }
-              write_str_frame_(buf);
-            }
+          }
+          write_str_frame_(buf);
+        } else if (op == CFG_OP_GET_REQ) {
+          /* GET_REQ payload: op(1) + field_id(1) = 2 bytes.
+           * v1: broadcast-and-everyone-responds; P5-2 will add target_name
+           * scoping here so non-target peers can ignore. */
+          if (plen < 2) return;
+          uint8_t field_id = p[1];
+          char buf[20];
+          int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", field_id);
+          if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
+            ESP_LOGE(TAG, "CFG_GET snprintf truncation");
             break;
-          case CFG_OP_GET_RESP:
-          case CFG_OP_SET_ACK:
-            /* Update HA peer-config entity, see Task 11 */
-            break;
-          default:
-            ESP_LOGD(TAG, "MSG_CONFIG unknown op=%u", op);
-            break;
+          }
+          write_str_frame_(buf);
+          /* STC reply arrives via UART RX path -> published to HA */
         }
+        /* GET_RESP / SET_ACK: P5-2 */
         break;
       }
       default:
@@ -959,15 +958,6 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     mesh_tx_(MSG_COMMAND, payload, 9);
   }
 
-  /* ---- target_matches_us_: v1 always returns true (accept all GET_REQ) ---
-   * Proper per-MAC targeting will be refined in Task 11 once the gateway
-   * can address specific peers.  For now every tracker responds to every
-   * CONFIG request; the gateway de-dups by tracking which response is from
-   * which peer. */
-  bool target_matches_us_(const uint8_t * /*src*/) {
-    /* TODO(Task 11): compare src against my_mac_ for unicast config ops */
-    return true;
-  }
 };
 
 /* Out-of-class definition of the static singleton pointer. */
