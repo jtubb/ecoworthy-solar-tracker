@@ -17,6 +17,7 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import uart
 from esphome.const import CONF_ID
+from esphome.core import CORE
 
 CODEOWNERS = ["@jtubb"]
 DEPENDENCIES = ["uart"]
@@ -88,6 +89,17 @@ async def to_code(config):
     await cg.register_component(var, config)
     await uart.register_uart_device(var, config)
     if CONF_MESH in config:
+        # The mesh binding key is the esphome.name (wire_id_), capped at 31
+        # chars to fit the 32-byte NUL-terminated field.  Reject longer names
+        # at codegen so the truncation case never reaches runtime.
+        device_name = CORE.name
+        if device_name and len(device_name) > 31:
+            raise cv.Invalid(
+                f"esphome.name '{device_name}' is {len(device_name)} chars; "
+                f"maximum is 31 when mesh: is configured (the mesh wire format "
+                f"reserves a 32-byte NUL-terminated node_name field).  "
+                f"Shorten the name or omit the mesh: block."
+            )
         # AES-128-GCM + SHA256 for the mesh.  rweather/Crypto exposes
         # <AES.h>, <GCM.h>, <SHA256.h>.  ESPHome wires this through to
         # PlatformIO's lib_deps for the build.
