@@ -412,3 +412,70 @@ git commit -m "fix(esp): P5-10 -- reject esphome.name > 31 chars when mesh: is c
 
 **Execution order (locked):** numerical order P5-1, P5-2, P5-3, P5-4, P5-5, P5-6, P5-7, P5-9, P5-10.
 P5-8 dropped from scope.
+
+---
+
+## Task P6-1: Auto-elect wind primary (drop role declaration)
+
+**Goal:** Replace YAML-declared `local_role: primary|secondary` with a `has_wind_sensor:` capability bit advertised in TELEMETRY broadcasts. Lowest-MAC peer with the bit set is the active wind broadcaster. Failover is automatic.
+
+**Files:**
+- Modify: `esphome/components/tracker_bridge/tracker_bridge.h`
+- Modify: `esphome/components/tracker_bridge/__init__.py`
+- Modify: `EcoWorthyFirmware/esphome/solar-tracker-1.yaml` (uses sensor)
+- Modify: `EcoWorthyFirmware/esphome/solar-tracker-2.yaml` (no sensor)
+
+**Wire-format change:**
+TELEMETRY payload grows from 4 to 5 bytes: `az_pct(1) el_pct(1) wind_used(1) mode(1) flags(1)`.
+Bit 0 of `flags` = `has_wind_sensor`. Bits 1-7 reserved for future.
+Receivers update `PeerEntry.has_wind_sensor` from the bit on every TELEMETRY rx.
+
+**Election logic** (mirrors gateway election):
+```cpp
+bool am_i_wind_primary_() {
+  if (!has_wind_sensor_) return false;
+  uint8_t my_mac[6];
+  WiFi.macAddress(my_mac);
+  for (const auto &kv : peers_) {
+    if (!kv.second.has_wind_sensor) continue;
+    if ((millis() - kv.second.last_telemetry_ms) > PEER_STALE_MS) continue;
+    if (kv.second.mac < my_mac) return false;  // lexicographic, lowest wins
+  }
+  return true;
+}
+```
+
+**Behavior changes:**
+- `mesh_tx_wind_()` is gated by `am_i_wind_primary_()` instead of `local_role_ == ROLE_PRIMARY`.
+- MSG_WIND dispatcher self-guard branches on `am_i_wind_primary_()` instead of role.
+- `local_role_` member, `ROLE_PRIMARY`/`ROLE_SECONDARY` constants, and `set_local_role()` setter all deleted.
+- `__init__.py` schema: `local_role:` removed, `has_wind_sensor:` added (cv.Optional default False).
+- YAML `solar-tracker-1.yaml` (has STC + sensor): `has_wind_sensor: true`.
+- YAML `solar-tracker-2.yaml` (no STC, no sensor): omit or `has_wind_sensor: false`.
+
+**Out of scope for P6-1:**
+- STC's `wind_source` EEPROM byte stays operator-controlled via LCD. Document that secondaries should have wind_source=1 to receive the auto-elected broadcasts. A future P6-2 could auto-sync STC `wind_source` based on `am_i_wind_primary_()` via `!cfg set id=33`.
+- Backward compat: clean break. TELEMETRY plen growing from 4 to 5 means old-firmware frames fail the new `plen < 5` guard and are dropped. Pre-release; acceptable.
+
+- [ ] **Step 1: Update wire schema** — add the 5th `flags` byte to `mesh_tx_telemetry_()`. Construct `flags = has_wind_sensor_ ? 0x01 : 0x00`.
+
+- [ ] **Step 2: Receive-side parsing** — in MSG_TELEMETRY dispatcher, `plen < 5` guard. Read `peers_[name_key].has_wind_sensor = (p[4] & 0x01) != 0;`.
+
+- [ ] **Step 3: Add `am_i_wind_primary_()` method** alongside `is_acting_gateway_()`.
+
+- [ ] **Step 4: Gate `mesh_tx_wind_()` in the 5s broadcast lambda** — `if (am_i_wind_primary_()) mesh_tx_wind_();`.
+
+- [ ] **Step 5: Update MSG_WIND self-guard** — replace `local_role_ == ROLE_PRIMARY` check with `am_i_wind_primary_()` check. Still drop self-echo via name_key compare.
+
+- [ ] **Step 6: Delete `local_role_`, `ROLE_PRIMARY`, `ROLE_SECONDARY`, `set_local_role()`** — and remove the `local_role:` schema entry in `__init__.py`.
+
+- [ ] **Step 7: Add `has_wind_sensor_` member + `set_has_wind_sensor()` setter** wired from `__init__.py`'s new schema field.
+
+- [ ] **Step 8: Update YAMLs**:
+  - `solar-tracker-1.yaml`: `local_role: secondary` → `has_wind_sensor: true` (it has the STC + real sensor).
+  - `solar-tracker-2.yaml`: `local_role: primary` → omit `has_wind_sensor:` (or set false; it has no sensor — was a bench helper that *pretended* to be primary).
+
+- [ ] **Step 9: Bench-validate** — flash both, confirm tracker-1 elects itself as primary (broadcasts WIND), tracker-2 doesn't broadcast WIND but its `wind_override` slider still works for the bench-helper case. Power off tracker-1: tracker-2 stays silent (no auto-promotion since it has no sensor). Power tracker-1 back on: WIND resumes within 5s.
+
+- [ ] **Step 10: Commit**: `feat(esp): P6-1 -- auto-elect wind primary via has_wind_sensor capability bit`
+
