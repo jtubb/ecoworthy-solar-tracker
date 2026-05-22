@@ -114,5 +114,11 @@ async def to_code(config):
         cg.add(var.set_has_wind_sensor(mesh[CONF_HAS_WIND_SENSOR]))
         # Register declared peers before sensor/text_sensor/number platforms run
         # (this to_code executes first; platforms attach afterwards).
+        # Skip an entry that matches the local esphome.name -- lets the
+        # operator share a single peers list across the whole fleet (e.g.
+        # via `peers: !secret tracker_peers`) without each tracker wasting
+        # a peer_decls_ slot on itself.
         for peer_name in mesh.get(CONF_PEERS, []):
+            if peer_name == device_name:
+                continue
             cg.add(var.register_peer(peer_name))
