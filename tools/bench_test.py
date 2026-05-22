@@ -135,7 +135,14 @@ def load_config() -> HarnessConfig:
     for name, vals in nodes_raw.items():
         # Allow env-var overrides: TRACKER1_API_KEY, TRACKER2_API_KEY (by index)
         env_key = f"TRACKER{list(nodes_raw.keys()).index(name) + 1}_API_KEY"
-        api_key = os.environ.get(env_key) or vals.get("api_key", "")
+        api_key = (os.environ.get(env_key) or vals.get("api_key", "") or "").strip()
+        if not api_key:
+            print(
+                f"[ERROR] No api_key for '{name}'. Set 'api_key:' in "
+                f"bench_test_config.yaml or export {env_key}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         nodes[name] = NodeConfig(
             name=name,
             host=vals["host"],
@@ -197,7 +204,11 @@ class TestHarness:
 
     async def connect_all(self) -> None:
         for name, node in self._cfg.nodes.items():
-            print(f"[INFO] Connecting to {name} ({node.host})...")
+            key_preview = (
+                f"{node.api_key[:4]}...{node.api_key[-4:]} ({len(node.api_key)} chars)"
+                if len(node.api_key) > 8 else "(short / suspect)"
+            )
+            print(f"[INFO] Connecting to {name} ({node.host}) with api_key={key_preview}")
             client = APIClient(
                 node.host,
                 6053,
@@ -207,10 +218,18 @@ class TestHarness:
             try:
                 await client.connect(login=True)
             except Exception as e:
+                hint = ""
+                if "Encryption" in str(e) or "encryption" in str(e):
+                    hint = (
+                        "\n       The api_key in bench_test_config.yaml doesn't match the\n"
+                        "       device's `api.encryption.key` (from secrets.yaml's ha_api_key).\n"
+                        "       Copy the EXACT base64 string -- no quotes, no whitespace.\n"
+                        "       Verify in the ESPHome dashboard: edit the device YAML, look at\n"
+                        "       `api: encryption: key: !secret ha_api_key`, then look at the\n"
+                        "       resolved value in secrets.yaml."
+                    )
                 print(
-                    f"\nERROR: Could not connect to {name} at {node.host}: {e}\n"
-                    f"       Check that the node is powered, on the network, and that\n"
-                    f"       bench_test_config.yaml has the correct api_key.\n",
+                    f"\nERROR: Could not connect to {name} at {node.host}: {e}{hint}\n",
                     file=sys.stderr,
                 )
                 # Disconnect any already-connected clients before exiting
