@@ -116,6 +116,40 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     ESP_LOGW(TAG, "set_mode_sensor_for: unknown peer_id '%s'", peer_id.c_str());
   }
 
+#ifdef USE_NUMBER
+  /* --- Per-peer config number setters (P5-2: wired by number.py to_code) ---
+   * Empty peer_id → local STC; non-empty → store in peer_decls_ for GET_RESP
+   * publish_state when the mesh delivers a CFG_OP_GET_RESP for that peer. */
+  void set_wind_storm_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_wind_storm_num_ = n; return; }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.wind_storm = n; return; }
+    ESP_LOGW(TAG, "set_wind_storm_number_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+  void set_wind_release_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_wind_release_num_ = n; return; }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.wind_release = n; return; }
+    ESP_LOGW(TAG, "set_wind_release_number_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+  void set_storm_dwell_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_storm_dwell_num_ = n; return; }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.storm_dwell = n; return; }
+    ESP_LOGW(TAG, "set_storm_dwell_number_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+  void set_track_thresh_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_track_thresh_num_ = n; return; }
+    auto key = make_name_key_(peer_id);
+    auto it = peer_decls_.find(key);
+    if (it != peer_decls_.end()) { it->second.track_thresh = n; return; }
+    ESP_LOGW(TAG, "set_track_thresh_number_for: unknown peer_id '%s'", peer_id.c_str());
+  }
+#endif
+
   /* --- Peer registration (called from __init__.py to_code for each declared peer) --- */
   void register_peer(const std::string &name) {
     auto key = make_name_key_(name);
@@ -293,6 +327,54 @@ class TrackerBridge : public Component, public uart::UARTDevice {
      * commands ("!wind=...", "!park", ...) loop back on the single-wire
      * bus.  All start-with-! and start-with-? frames originated here. */
     if (p == "?" || (!p.empty() && p[0] == '!')) return;
+
+    /* P5-2: STC cfg read-back reply: "cfg id=N val=V"
+     * Parse the k=v pairs, publish_state on the matching local slider,
+     * then broadcast MSG_CONFIG GET_RESP so the gateway can update HA
+     * sliders for remote peers that are watching this node. */
+    if (p.compare(0, 4, "cfg ") == 0) {
+      int cfg_id = -1, cfg_val = -1;
+      size_t i = 4;
+      while (i < p.size()) {
+        while (i < p.size() && p[i] == ' ') i++;
+        if (i >= p.size()) break;
+        size_t kstart = i;
+        while (i < p.size() && p[i] != '=' && p[i] != ' ') i++;
+        if (i >= p.size() || p[i] != '=') break;
+        std::string key = p.substr(kstart, i - kstart);
+        i++;  /* skip '=' */
+        size_t vstart = i;
+        while (i < p.size() && p[i] != ' ') i++;
+        std::string val = p.substr(vstart, i - vstart);
+        if (key == "id")       cfg_id  = std::atoi(val.c_str());
+        else if (key == "val") cfg_val = std::atoi(val.c_str());
+      }
+      if (cfg_id < 1 || cfg_id > 4 || cfg_val < 0) {
+        ESP_LOGD(TAG, "cfg reply ignored: id=%d val=%d", cfg_id, cfg_val);
+        return;
+      }
+      uint8_t fid = (uint8_t)cfg_id;
+      uint8_t fval = (uint8_t)(cfg_val > 255 ? 255 : cfg_val);
+      ESP_LOGD(TAG, "cfg reply: fid=%u val=%u", (unsigned)fid, (unsigned)fval);
+      /* Publish to the local slider (if wired). */
+#ifdef USE_NUMBER
+      {
+        number::Number *local_num = nullptr;
+        switch (fid) {
+          case 1: local_num = local_wind_storm_num_;   break;  /* CFG_F_WIND_STORM */
+          case 2: local_num = local_wind_release_num_; break;  /* CFG_F_WIND_RELEASE */
+          case 3: local_num = local_storm_dwell_num_;  break;  /* CFG_F_STORM_DWELL */
+          case 4: local_num = local_track_thresh_num_; break;  /* CFG_F_TRACK_THRESH */
+        }
+        if (local_num) local_num->publish_state(float(fval));
+      }
+#endif
+      /* Broadcast GET_RESP on the mesh so the acting gateway can publish
+       * the value to HA sliders for the corresponding remote peer entry. */
+      if (mesh_enabled_) broadcast_cfg_get_resp_(fid, fval);
+      return;
+    }
+
     /* v1 only consumes status replies. */
     if (p.compare(0, 3, "az=") != 0) {
       ESP_LOGD(TAG, "ignored payload: %s", p.c_str());
@@ -334,6 +416,17 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   sensor::Sensor *el_{nullptr};
   sensor::Sensor *wind_{nullptr};
   text_sensor::TextSensor *mode_{nullptr};
+
+#ifdef USE_NUMBER
+  /* Local config number entities -- populated by set_*_number_for("", n).
+   * When the local STC replies to a !cfg get, the receive path calls
+   * publish_state here AND broadcasts GET_RESP to the mesh so remote
+   * gateway nodes can update their per-peer sliders. */
+  number::Number *local_wind_storm_num_{nullptr};
+  number::Number *local_wind_release_num_{nullptr};
+  number::Number *local_storm_dwell_num_{nullptr};
+  number::Number *local_track_thresh_num_{nullptr};
+#endif
 
   /* ================================================================
    * Phase 4: ESP-NOW mesh -- AES-128-GCM authenticated broadcast
@@ -501,6 +594,46 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       this->mesh_tx_telemetry_();
       if (this->local_role_ == ROLE_PRIMARY) this->mesh_tx_wind_();
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
+    });
+
+    /* Every 30 s: acting gateway polls each declared remote peer for its 4
+     * config fields.  Also polls the local STC's config so local sliders stay
+     * synced after operator changes via the LCD menu.
+     *
+     * Flow for remote peers:
+     *   GET_REQ (mesh) → targeted peer's ESP → "!cfg get id=N" (UART) →
+     *   STC replies "cfg id=N val=V" (UART) → handle_payload_ catches it →
+     *   broadcast_cfg_get_resp_ (mesh) → acting gateway publishes to HA slider.
+     *
+     * Flow for local STC (no mesh hop):
+     *   "!cfg get id=N" (UART) → STC replies "cfg id=N val=V" (UART) →
+     *   handle_payload_ → publish_state on local slider + broadcast GET_RESP
+     *   so any other gateway node also sees the current value. */
+    this->set_interval("cfg_poll", 30000, [this]() {
+      /* --- Remote peers (acting gateway only) --- */
+      if (this->is_acting_gateway_()) {
+        for (const auto &kv : this->peer_decls_) {
+          /* Skip self: don't send a mesh GET_REQ to our own wire_id_ */
+          if (memcmp(kv.first.data(), this->wire_id_, 32) == 0) continue;
+          for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4}) {
+            uint8_t req[1 + 32 + 1];
+            req[0] = CFG_OP_GET_REQ;
+            memcpy(req + 1, kv.first.data(), 32);
+            req[33] = fid;
+            this->mesh_tx_(MSG_CONFIG, req, sizeof(req));
+            ESP_LOGD(TAG, "cfg_poll GET_REQ peer='%.32s' fid=%u",
+                     kv.first.data(), (unsigned)fid);
+          }
+        }
+      }
+      /* --- Local STC (always, regardless of gateway role) ---
+       * The STC reply flows through handle_payload_ which publishes the
+       * local slider and, if mesh is up, broadcasts GET_RESP for peers. */
+      for (uint8_t fid : {(uint8_t)1, (uint8_t)2, (uint8_t)3, (uint8_t)4}) {
+        char buf[20];
+        int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", (unsigned)fid);
+        if (sn > 0 && (size_t)sn < sizeof(buf)) this->write_str_frame_(buf);
+      }
     });
   }
 
@@ -773,11 +906,11 @@ class TrackerBridge : public Component, public uart::UARTDevice {
           }
           write_str_frame_(buf);
         } else if (op == CFG_OP_GET_REQ) {
-          /* GET_REQ payload: op(1) + field_id(1) = 2 bytes.
-           * v1: broadcast-and-everyone-responds; P5-2 will add target_name
-           * scoping here so non-target peers can ignore. */
-          if (plen < 2) return;
-          uint8_t field_id = p[1];
+          /* GET_REQ payload (P5-2): op(1) + target_name(32) + field_id(1) = 34 bytes.
+           * Targeted: ignore if target_name doesn't match our wire_id_. */
+          if (plen < 1 + 32 + 1) return;
+          if (memcmp(p + 1, wire_id_, 32) != 0) break;  /* not for us */
+          uint8_t field_id = p[33];
           char buf[20];
           int sn = snprintf(buf, sizeof(buf), "!cfg get id=%u", field_id);
           if (sn <= 0 || (size_t)sn >= sizeof(buf)) {
@@ -785,9 +918,39 @@ class TrackerBridge : public Component, public uart::UARTDevice {
             break;
           }
           write_str_frame_(buf);
-          /* STC reply arrives via UART RX path -> published to HA */
+          /* STC replies via UART -> handle_payload_ catches "cfg id=N val=V"
+           * -> broadcasts GET_RESP via broadcast_cfg_get_resp_() */
+        } else if (op == CFG_OP_GET_RESP) {
+          /* GET_RESP payload: op(1) + src_name(32) + field_id(1) + value(1) = 35 bytes.
+           * Sender identifies itself as src_name; we look up its peer_decls_ entry and
+           * call publish_state on the matching ConfigNumber to update the HA slider. */
+          if (plen < 1 + 32 + 1 + 1) return;
+          /* Don't process our own echoed GET_RESP */
+          if (memcmp(p + 1, wire_id_, 32) == 0) break;
+          auto src_key = make_name_key_(std::string((const char *)(p + 1), 32));
+          /* Truncate at first NUL for clean logging; key itself is already NUL-padded. */
+          src_key[31] = '\0';
+          auto it = peer_decls_.find(src_key);
+          if (it == peer_decls_.end()) {
+            ESP_LOGD(TAG, "GET_RESP from undeclared peer '%.32s' -- ignored", src_key.data());
+            break;
+          }
+          uint8_t field_id = p[33];
+          uint8_t value    = p[34];
+          ESP_LOGD(TAG, "GET_RESP peer='%.32s' fid=%u val=%u",
+                   src_key.data(), (unsigned)field_id, (unsigned)value);
+#ifdef USE_NUMBER
+          number::Number *target = nullptr;
+          switch (field_id) {
+            case 1: target = it->second.wind_storm;   break;  /* CFG_F_WIND_STORM */
+            case 2: target = it->second.wind_release; break;  /* CFG_F_WIND_RELEASE */
+            case 3: target = it->second.storm_dwell;  break;  /* CFG_F_STORM_DWELL */
+            case 4: target = it->second.track_thresh; break;  /* CFG_F_TRACK_THRESH */
+          }
+          if (target) target->publish_state(float(value));
+#endif
         }
-        /* GET_RESP / SET_ACK: P5-2 */
+        /* SET_ACK: P5-2 stub -- no caller emits SET_ACKs yet; reserved for future. */
         break;
       }
       default:
@@ -821,6 +984,21 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     uint8_t p[1] = { (uint8_t)rssi };
     mesh_tx_(MSG_GATEWAY_HB, p, 1);
     ESP_LOGD(TAG, "tx GATEWAY_HB rssi=%d", (int)rssi);
+  }
+
+  /* ---- broadcast_cfg_get_resp_: emit MSG_CONFIG GET_RESP for this node ----
+   * Called after parsing a "cfg id=N val=V" reply from the local STC.
+   * Payload: op(1) + src_name(32) + field_id(1) + value(1) = 35 bytes.
+   * The gateway receives this and calls publish_state on the matching
+   * per-peer ConfigNumber to update HA sliders. */
+  void broadcast_cfg_get_resp_(uint8_t field_id, uint8_t value) {
+    uint8_t p[1 + 32 + 1 + 1];
+    p[0] = CFG_OP_GET_RESP;
+    memcpy(p + 1, wire_id_, 32);
+    p[33] = field_id;
+    p[34] = value;
+    mesh_tx_(MSG_CONFIG, p, sizeof(p));
+    ESP_LOGD(TAG, "tx CFG_GET_RESP fid=%u val=%u", (unsigned)field_id, (unsigned)value);
   }
 
   /* Map STC mode string (from uart_mode_str in main.c) to a compact code.

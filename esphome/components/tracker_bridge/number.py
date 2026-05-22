@@ -107,6 +107,16 @@ async def to_code(config):
 
     # --- RW config sliders ---
     peer_id = config.get(CONF_PEER_ID, "")
+    # Map config key → TrackerBridge setter name for the GET_RESP read-back wiring
+    # (P5-2). After creating each ConfigNumber, call the matching setter so the
+    # dispatcher's publish_state path has a pointer to reach without going through
+    # the ConfigNumber class itself.
+    _FIELD_SETTER = {
+        CONF_WIND_STORM:   "set_wind_storm_number_for",
+        CONF_WIND_RELEASE: "set_wind_release_number_for",
+        CONF_STORM_DWELL:  "set_storm_dwell_number_for",
+        CONF_TRACK_THRESH: "set_track_thresh_number_for",
+    }
     for conf_key, field_id in _FIELD_ID.items():
         if conf_key not in config:
             continue
@@ -120,3 +130,8 @@ async def to_code(config):
         cg.add(n.set_parent(parent))
         cg.add(n.set_peer_id(peer_id))
         cg.add(n.set_field_id(field_id))
+        # Wire the number pointer into TrackerBridge so GET_RESP dispatch can
+        # call publish_state on it when the STC (local) or mesh (remote) delivers
+        # an authoritative read-back value.
+        setter = _FIELD_SETTER[conf_key]
+        cg.add(getattr(parent, setter)(peer_id, n))
