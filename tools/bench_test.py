@@ -163,12 +163,12 @@ def load_config() -> HarnessConfig:
 class LogLine:
     ts: float  # time.monotonic()
     level: int
-    tag: str
     message: str
 
     def __str__(self) -> str:
-        lvl = ["", "ERR", "WRN", "INF", "DBG", "VRB"][min(self.level, 5)]
-        return f"[{lvl}][{self.tag}] {self.message}"
+        # message already contains the [LVL][tag:line] prefix from ESPHome's
+        # logger; no need to re-decorate.
+        return self.message
 
 
 # ---------------------------------------------------------------------------
@@ -259,11 +259,17 @@ class TestHarness:
 
     async def _subscribe_logs(self, name: str, client: APIClient) -> None:
         def on_log(msg: aioesphomeapi.LogMessage) -> None:
+            # aioesphomeapi's LogMessage has no `tag` field -- the component
+            # tag is embedded in `message` as the standard ESPHome prefix
+            # "[LVL][tag:line]: ...".  msg.message may arrive as bytes or
+            # str depending on library version; normalize defensively.
+            raw = msg.message
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="replace")
             line = LogLine(
                 ts=time.monotonic(),
-                level=msg.level,
-                tag=msg.tag,
-                message=msg.message,
+                level=getattr(msg, "level", 0),
+                message=raw,
             )
             self._log_ring[name].append(line)
             self._log_event.set()
