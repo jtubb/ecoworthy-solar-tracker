@@ -198,6 +198,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * later) will overwrite this -- don't wire both up at once. */
   void set_wind_override(uint8_t v) { local_wind_used_ = v; }
 
+  /* True iff an STC has replied to a status poll within the last ~5s.
+   * Used by the WindOverrideNumber to warn when the bench-helper slider
+   * is operated on an STC-equipped node (the next poll will clobber). */
+  bool has_recent_stc_reply() const {
+    if (last_stc_reply_ms_ == 0) return false;
+    return (millis() - last_stc_reply_ms_) < 5000;
+  }
+
   /* HA->mesh broadcast methods (callable from buttons/numbers) */
   void broadcast_force_park()    { mesh_tx_command_(broadcast_mac_(), CMD_FORCE_PARK,    0, 0); }
   void broadcast_force_release() { mesh_tx_command_(broadcast_mac_(), CMD_FORCE_RELEASE, 0, 0); }
@@ -454,6 +462,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (el   >= 0) local_el_pct_   = (uint8_t)(el   > 255 ? 255 : el);
     if (wind >= 0) local_wind_used_ = (uint8_t)(wind > 255 ? 255 : wind);
     if (!mode.empty()) local_mode_ = mode;
+    /* Mark that an STC is alive on the UART -- WindOverrideNumber uses this
+     * to warn when a bench-helper slider is moved on a real STC-equipped
+     * node (the next status poll will overwrite anything HA sets). */
+    last_stc_reply_ms_ = millis();
   }
 
   sensor::Sensor *az_{nullptr};
@@ -507,6 +519,10 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   uint8_t local_el_pct_{0};
   uint8_t local_wind_used_{0};
   std::string local_mode_{};
+  /* Wallclock (millis) of the last STC status reply; 0 if no STC ever
+   * responded.  Used by WindOverrideNumber to warn when the bench-helper
+   * slider is moved on an STC-equipped node. */
+  uint32_t last_stc_reply_ms_{0};
   /* ROLE_PRIMARY or ROLE_SECONDARY.
    * Bootstrap default comes from YAML's mesh.local_role: (set via set_local_role() at codegen).
    * P5-7: on boot, setup() fires a one-shot "!cfg get id=32" (CFG_F_ROLE=0x20).  When the STC
@@ -1245,6 +1261,11 @@ class WindOverrideNumber : public number::Number, public Component {
  protected:
   void control(float value) override {
     if (parent_ == nullptr) return;
+    if (parent_->has_recent_stc_reply()) {
+      ESP_LOGW(TAG, "wind_override moved on an STC-equipped node; the next "
+                    "STC status poll (~2s) will overwrite this value.  This "
+                    "slider is meant for bench-helper nodes without an STC.");
+    }
     uint8_t v = (value < 0.0f) ? 0 : (value > 99.0f) ? 99 : (uint8_t) value;
     parent_->set_wind_override(v);
     this->publish_state(float(v));
