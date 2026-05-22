@@ -20,7 +20,13 @@ from esphome.const import CONF_ID
 
 CODEOWNERS = ["@jtubb"]
 DEPENDENCIES = ["uart"]
-MULTI_CONF = True
+# One tracker_bridge instance per device.  The C++ side uses a static
+# singleton pointer for the ESP-NOW recv callback dispatch; a second
+# instance would silently lose mesh frames for whichever one didn't
+# grab the singleton last.  There's no physical scenario where two
+# tracker_bridge blocks make sense on one ESP-01S (one STC, one HA
+# endpoint per device), so disallow at codegen.
+MULTI_CONF = False
 
 tracker_bridge_ns = cg.esphome_ns.namespace("tracker_bridge")
 TrackerBridge = tracker_bridge_ns.class_(
