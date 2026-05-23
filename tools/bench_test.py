@@ -106,6 +106,13 @@ class NodeConfig:
 class HarnessConfig:
     nodes: Dict[str, NodeConfig]
     storm_dwell_test_value: int = 1
+    # P5-13 baseline values: reset_to_baseline_() restores these on each node
+    # before every test runs, so residual state from prior tests doesn't leak
+    # into the next test's assertions.
+    baseline_wind_storm_mps: int = 15
+    baseline_wind_release_mps: int = 10
+    baseline_storm_dwell_min: int = 10
+    baseline_track_thresh: int = 3
 
 
 def load_config() -> HarnessConfig:
@@ -152,6 +159,10 @@ def load_config() -> HarnessConfig:
     return HarnessConfig(
         nodes=nodes,
         storm_dwell_test_value=int(raw.get("storm_dwell_test_value", 1)),
+        baseline_wind_storm_mps=int(raw.get("baseline_wind_storm_mps", 15)),
+        baseline_wind_release_mps=int(raw.get("baseline_wind_release_mps", 10)),
+        baseline_storm_dwell_min=int(raw.get("baseline_storm_dwell_min", 10)),
+        baseline_track_thresh=int(raw.get("baseline_track_thresh", 3)),
     )
 
 
@@ -383,6 +394,90 @@ class TestHarness:
         """Trigger a soft reboot via the built-in restart button."""
         # ESPHome exposes a "restart" button on every device
         await self.press_button(name, "restart")
+
+    # ------------------------------------------------------------------
+    # Per-test state reset (P5-13)
+    # ------------------------------------------------------------------
+
+    async def reset_to_baseline_(self, *node_names: str) -> None:
+        """
+        Reset each named node to a known-good baseline before a test runs.
+        Idempotent: safe to call even when the node is already at baseline.
+
+        Steps per node:
+          1. Turn off Test Offline switch so the node is broadcasting.
+          2. If mode is "storm", temporarily set storm_dwell_min=1 and press
+             Force Release; wait up to 90s for mode to leave "storm".
+          3. Restore baseline values on the four config sliders.
+
+        Slider sets are best-effort: a node missing one of the sliders (e.g.
+        pre-P5-12 tracker-2 with no STC) doesn't fail the reset.  Storm-clear
+        timeout failures log a WARN but don't fail the reset either -- the
+        test that runs next will surface the real assertion failure.
+        """
+        cfg = self._cfg
+
+        # 1. Ensure each node is online (Test Offline OFF).  Sleep 6 s so a
+        # node coming back from a long test_offline=True window has time to
+        # re-broadcast TELEMETRY + GATEWAY_HB and let the mesh re-settle on
+        # gateway / wind-primary roles before the next test's commands fly.
+        # 2 s here used to be enough but produces ~33% flakiness on the first
+        # test after test_no_primary_baseline (which silences t1 for 80+ s).
+        for name in node_names:
+            try:
+                await self.set_switch(name, "test_offline_switch", False)
+            except _FailError:
+                pass
+        await asyncio.sleep(6)
+
+        # 2. For any node currently in storm, force release with short dwell
+        in_storm: List[str] = []
+        for name in node_names:
+            mode = self._entity_state[name].get("mode")
+            if mode and "storm" in str(mode).lower():
+                in_storm.append(name)
+
+        for name in in_storm:
+            try:
+                await self.set_number(name, "storm_dwell_min", 1.0)
+            except _FailError:
+                pass
+            try:
+                await self.press_button(name, "force_release")
+            except _FailError:
+                pass
+
+        if in_storm:
+            deadline = time.monotonic() + 90.0
+            pending = set(in_storm)
+            while pending and time.monotonic() < deadline:
+                for name in list(pending):
+                    mode = self._entity_state[name].get("mode")
+                    if not mode or "storm" not in str(mode).lower():
+                        pending.discard(name)
+                if pending:
+                    self._state_event.clear()
+                    try:
+                        await asyncio.wait_for(self._state_event.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+            if pending:
+                print(f"  [WARN] reset_to_baseline_: {sorted(pending)} still in storm after 90s")
+
+        # 3. Restore baseline slider values
+        for name in node_names:
+            for entity_id, val in (
+                ("wind_storm_mps",   cfg.baseline_wind_storm_mps),
+                ("wind_release_mps", cfg.baseline_wind_release_mps),
+                ("storm_dwell_min",  cfg.baseline_storm_dwell_min),
+                ("track_thresh",     cfg.baseline_track_thresh),
+            ):
+                try:
+                    await self.set_number(name, entity_id, float(val))
+                except _FailError:
+                    pass
+        await asyncio.sleep(1)  # let SETs reach the STC
+        print(f"  [INFO] reset_to_baseline_({', '.join(node_names)}) ok")
 
     # ------------------------------------------------------------------
     # Assertion helpers
@@ -802,9 +897,35 @@ async def test_dual_primary_election_failover(h: TestHarness) -> None:
 
 async def test_gateway_failover(h: TestHarness) -> None:
     """
-    Identify the acting gateway, silence it via Test Offline, then verify the
-    other node takes over the gateway role within GATEWAY_HB stale time (15 s).
+    MANUAL TEST -- broken by P5-12.
+
+    Original premise: silence the acting gateway, verify the other node logs
+    a '[gateway] publish peer' line within ~35 s (election-driven takeover).
+
+    The '[gateway] publish peer' log only fires when the gateway publishes
+    peer-mirror entities.  P5-12 (2026-05-23) removed peer mirrors from both
+    YAMLs because both nodes now have their own STC + native entities.
+    Result: identify_gateway() has no signal to look at and always returns
+    None; the test falls back to assuming t1 is the gateway when election
+    typically picks t2 (lower MAC); silencing the wrong node does nothing.
+
+    Refactor TBD -- needs either:
+      (a) firmware-side: add a periodic `[I] gateway role: active` LOGD on
+          whichever node is the elected gateway, decoupled from peer-mirror
+          publishing.  ~10 line change in tracker_bridge.h.
+      (b) harness-side: parse MAC addresses from `mesh rx type=3` lines on
+          each node, compute the lowest-MAC active node, and assert that
+          when it goes offline the next-lowest takes over.  Doesn't need
+          firmware changes but is more code.
+
+    Recommend (a).  Filed as P5-15 in the deferred-cleanups plan.
     """
+    if not MANUAL_FLAG:
+        raise _ManualSkip(
+            "Broken by P5-12 -- '[gateway] publish peer' log line no longer "
+            "exists since peer mirrors were dropped.  Refactor TBD (P5-15).  "
+            "Run with --include-manual to attempt the legacy version anyway."
+        )
     t1 = "solar-tracker-1"
     t2 = "solar-tracker-2"
 
@@ -988,12 +1109,24 @@ async def run_tests(
     skipped = 0
     total_start = time.monotonic()
 
+    node_names = tuple(harness._cfg.nodes.keys())
     for name, fn in tests:
         start = time.monotonic()
         sys.stdout.write(f"[RUN]  {name} ")
         sys.stdout.flush()
 
         try:
+            # P5-13: reset each node to baseline before running the test, so
+            # residual state from prior tests (storm mode, modified sliders,
+            # test_offline left on, ...) can't leak into this test's assertions.
+            # Skipped for manual tests that explicitly raise _ManualSkip before
+            # touching anything -- the reset would just waste 5-10s.
+            try:
+                await harness.reset_to_baseline_(*node_names)
+            except _ManualSkip:
+                raise  # let the skip path handle it
+            except Exception as reset_err:
+                print(f"\n  [WARN] reset_to_baseline_ raised: {reset_err!r}")
             await fn(harness)
             elapsed = time.monotonic() - start
             print(f" PASS ({elapsed:.1f}s)")

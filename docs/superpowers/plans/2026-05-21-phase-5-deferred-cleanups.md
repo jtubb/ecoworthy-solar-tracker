@@ -32,6 +32,7 @@ rweather/Crypto + AES-128-GCM (ESP).
 | P5-12 | YAML migration when tracker-2 gets its own STC | Med | Low | Low | Drop tracker-1's peer mirrors for clean entity_ids |
 | P5-13 | Bench harness per-test state isolation | Med | Low | Low | test_force_park_release / test_gateway_failover flaky in suite |
 | P5-14 | expect_log default `since` cursor from last action | Med | Trivial | Low | Tight 100 ms back-window causes race against trigger actions |
+| P5-15 | Add gateway-role LOGD; rework test_gateway_failover | Med | Low | Low | P5-12 removed the peer-publish log the test relied on |
 
 (P5-8 — ESPHome dashboard bind-mount workflow doc — was dropped from scope.)
 
@@ -817,4 +818,63 @@ has been recorded yet).
   callers don't specify).
 
 - [ ] **Step 6: Commit**: `test: P5-14 -- expect_log defaults since= to last action timestamp`
+
+---
+
+## Task P5-15: Add gateway-role LOGD; rework test_gateway_failover
+
+**Files:**
+- Modify: `esphome/components/tracker_bridge/tracker_bridge.h` (~the mesh_broadcasts set_interval lambda at ~line 648)
+- Modify: `tools/bench_test.py` (`identify_gateway()` and `test_gateway_failover`)
+
+**Why:** P5-12 removed peer-mirror entities from both tracker YAMLs.  The
+`[gateway] publish peer 'X' az=... el=...` LOGD that the harness used to
+identify the acting gateway only fires when the gateway publishes peer
+entities -- with no peer mirrors, that log line never appears.
+
+Concrete symptom (observed 2026-05-23 during P5-13 validation):
+`identify_gateway()` always returns None, the test falls back to
+`gw = t1`, but the actual elected gateway is t2 (it has the lower MAC:
+`84:F3:EB:...` < `EC:FA:BC:...`).  Silencing t1 doesn't change anything;
+the 35 s `expect_log(t2, r"\[gateway\]")` times out.
+
+P5-13 worked around this by `_ManualSkip`-gating the test.  Restore it
+to automated status here.
+
+**Approach:** Decouple gateway identification from peer-publish.  In the
+existing 5 s `mesh_broadcasts` set_interval lambda, log a one-line
+`[I] gateway role: active` (or `: standby`) whenever the
+`is_acting_gateway_()` computation returns true (or false).  Throttle so
+the log only appears on STATE CHANGE (active -> standby or vice versa),
+not every 5 s -- otherwise we spam the log.  The harness watches for
+`gateway role: active` to identify the gateway.
+
+- [ ] **Step 1: Add a `was_acting_gateway_` boolean** to TrackerBridge,
+  initialized to `false` in the constructor.
+
+- [ ] **Step 2: In the mesh_broadcasts lambda**, compute `bool now_gw =
+  is_acting_gateway_();` and compare to `was_acting_gateway_`.  If they
+  differ, log:
+  ```cpp
+  ESP_LOGI(TAG, "gateway role: %s", now_gw ? "active" : "standby");
+  was_acting_gateway_ = now_gw;
+  ```
+
+- [ ] **Step 3: Update `identify_gateway()`** in bench_test.py to watch
+  for `gateway role: active` log lines instead of `[gateway] publish peer`.
+  Keep the 20 s timeout window.
+
+- [ ] **Step 4: Remove the _ManualSkip gate** from test_gateway_failover
+  (added in P5-13).  Restore the original assertion to watch for
+  `gateway role: active` on the OTHER node after silencing the current
+  gateway:
+  ```python
+  await h.expect_log(other, r"gateway role: active", timeout=35.0, since=since_offline)
+  ```
+
+- [ ] **Step 5: Run the harness three times back-to-back.**  Expect
+  deterministic 5p/0f/2s (or 6p/0f/1s if test_gateway_failover is now
+  automated again).
+
+- [ ] **Step 6: Commit**: `feat(esp,test): P5-15 -- gateway-role LOGD + restored test_gateway_failover`
 

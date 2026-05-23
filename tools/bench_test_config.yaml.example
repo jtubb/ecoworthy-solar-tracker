@@ -17,3 +17,12 @@ nodes:
 # to during force-park tests.  Lower = faster test.  Restored at end of test.
 # Range: 1–60.  Default: 1 (the minimum allowed by the STC firmware).
 storm_dwell_test_value: 1
+
+# P5-13 baseline values: reset_to_baseline_() restores these on each node
+# before every test, so residual state from prior tests cannot leak into the
+# next test's assertions.  Match these to whatever you have configured on the
+# bench install (or leave defaults if you're not sure).
+baseline_wind_storm_mps: 15
+baseline_wind_release_mps: 10
+baseline_storm_dwell_min: 10
+baseline_track_thresh: 3
