@@ -688,15 +688,23 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
       this->peers_prune_();
       this->sync_stc_wsrc_to_election_(primary_now);
-      /* P5-15: log gateway role transitions so the bench harness can
-       * identify the acting gateway without depending on peer-publish
-       * side effects (which P5-12 removed).  Logged on STATE CHANGE only
-       * to avoid spamming the log every 5 s. */
+      /* P5-15: log gateway role so the bench harness (and operators) can
+       * identify the acting gateway without depending on peer-publish side
+       * effects (which P5-12 removed).
+       *
+       * State changes always log (active -> standby OR standby -> active).
+       *
+       * Steady-state ACTIVE also logs every tick (5 s).  This is the load-
+       * bearing detail: the bench harness subscribes to logs AFTER the
+       * first transition has already fired, so a transition-only log would
+       * be invisible until the next role flip.  Standby is silent in
+       * steady state to avoid spamming N-1 nodes' logs in larger arrays. */
       int8_t gw_now = this->is_acting_gateway_() ? 1 : 0;
-      if (gw_now != was_acting_gateway_) {
+      bool changed = (gw_now != was_acting_gateway_);
+      if (changed || gw_now == 1) {
         ESP_LOGI(TAG, "gateway role: %s", gw_now ? "active" : "standby");
-        was_acting_gateway_ = gw_now;
       }
+      if (changed) was_acting_gateway_ = gw_now;
     });
 
     /* Every 30 s: acting gateway polls each declared remote peer for its 4
