@@ -69,9 +69,6 @@ web_server:
   include_internal: true
 
 external_components:
-  # Raw TCP<->UART for debugging the wire when needed.
-  - source: github://oxan/esphome-stream-server
-    refresh: 0s
   # Phase 3/4 bridge component, fetched from the project repo on each
   # build.  Lives at <repo-root>/esphome/components/tracker_bridge/
   - source: github://jtubb/ecoworthy-solar-tracker
@@ -84,12 +81,10 @@ uart:
   baud_rate: 9600
   tx_pin: GPIO1
   rx_pin: GPIO3
-  debug:
-    direction: BOTH
-    after:
-      timeout: 100ms
-    sequence:
-      - lambda: UARTDebug::log_hex(direction, bytes, ' ');
+  # NOTE: do not add a `uart: debug:` block here.  It registers as a second
+  # consumer of the UART RX buffer and steals bytes from tracker_bridge --
+  # diagnosed 2026-05-22.  If you need to sniff the wire, use a logic analyser
+  # on GPIO1/3 instead.
 
 # --- Phase 3 bridge + Phase 4 mesh ------------------------------------
 tracker_bridge:
@@ -105,9 +100,10 @@ tracker_bridge:
     # one place (secrets.yaml) + creating its device YAML.
     peers: !secret tracker_peers
 
-stream_server:
-  uart_id: uart_bus
-  port: 23
+# NOTE: do not add a `stream_server:` block here.  It registers as a second
+# consumer of the UART and competes with tracker_bridge for RX bytes
+# (diagnosed 2026-05-22).  If you need a raw TCP<->UART debug shell, do it
+# on a spare ESP wired to the STC instead of multiplexing on this one.
 
 # --- Sensors / status -------------------------------------------------
 sensor:
@@ -136,11 +132,6 @@ text_sensor:
     tracker_bridge_id: bridge
     mode:
       name: "$friendly_name Mode"
-
-binary_sensor:
-  - platform: stream_server
-    connected:
-      name: "$friendly_name Stream Server Client Connected"
 
 # --- Phase 4 command buttons (mesh-broadcast to all trackers) ----------
 # P5-12: tracker-2 now has its own STC, so it needs native operator buttons
