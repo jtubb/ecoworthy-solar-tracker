@@ -30,6 +30,8 @@ rweather/Crypto + AES-128-GCM (ESP).
 | P5-10 | Schema validate `esphome.name <= 31 chars` at codegen | Low | Low | Low | Catch the truncation case before runtime warn |
 | P5-11 | Stagger cfg_poll burst to avoid half-duplex collision | Med | Trivial | Low | One of four cfg reads is dropped each 30 s cycle |
 | P5-12 | YAML migration when tracker-2 gets its own STC | Med | Low | Low | Drop tracker-1's peer mirrors for clean entity_ids |
+| P5-13 | Bench harness per-test state isolation | Med | Low | Low | test_force_park_release / test_gateway_failover flaky in suite |
+| P5-14 | expect_log default `since` cursor from last action | Med | Trivial | Low | Tight 100 ms back-window causes race against trigger actions |
 
 (P5-8 — ESPHome dashboard bind-mount workflow doc — was dropped from scope.)
 
@@ -697,4 +699,122 @@ entity_ids via the HA UI (the friendly names are already correct).
   depending on Step 6's decision -- update their gates if applicable.
 
 - [ ] **Step 10: Commit**: `feat(yaml): P5-12 -- migrate to per-device entities now that tracker-2 has STC`
+
+---
+
+## Task P5-13: Bench harness per-test state isolation
+
+**Files:**
+- Modify: `tools/bench_test.py`
+
+**Why:** Across three back-to-back full-suite runs on 2026-05-22, results varied
+3p/3f/2s, 3p/2f/2s, 5p/0f/2s.  The variance came entirely from
+`test_force_park_release` and `test_gateway_failover`.  Both run after siblings
+that may leave tracker state non-default (e.g. `storm_dwell_min` slider
+moved to test value 1, tracker stuck in storm mode if `force_release` racing
+the dwell timer, `test_offline` switch left on if a finally block didn't
+finish cleanly).  When the next test starts, its "wait for mode = storm" or
+"wait for mode = track" assertion either matches immediately (false-positive)
+or races a state machine that's already in the wrong phase (timeout).
+
+Both tests pass deterministically when run individually -- isolated context is
+not the same as suite context.
+
+**Approach:** Add a `reset_to_baseline_(harness, *node_names)` helper that
+runs at the START of each test's body (before any try block).  It should:
+
+1. For each node: toggle `Test Offline` OFF (via `set_switch`) and wait
+   for confirmation that mesh broadcasts have resumed (`tx TELEMETRY` log
+   line appears within 6 s).
+2. For each node: press `Force Release` to clear any sticky storm state,
+   then wait for mode != "storm" (timeout: ~max_dwell + margin).
+3. For each node: restore the four config sliders to canonical baseline
+   values read from `bench_test_config.yaml` (e.g. `baseline_wind_storm=15`,
+   `baseline_storm_dwell=10`).  This is essential because tests like
+   `test_force_park_release` and `test_ha_command_propagation` temporarily
+   set `storm_dwell_min = 1` and rely on a `finally` to restore -- a
+   finally that didn't run leaves it at 1 for the next test.
+4. Log a single `[INFO] reset_to_baseline_ ok` line so suite output stays
+   tidy.
+
+The helper takes the longest of any per-test setup but only runs once per
+test, so the suite walltime grows by ~5-10 s per test (still well under the
+3-minute total).
+
+- [ ] **Step 1: Write a failing test** that demonstrates the leakage.
+  Run the suite three times back-to-back via `python tools/bench_test.py --all`.
+  Confirm at least one run produces a different pass/fail mix than the others
+  (record the seed/timing in a comment, since this is inherently flaky).
+
+- [ ] **Step 2: Add the `reset_to_baseline_` helper** to `tools/bench_test.py`
+  in the `TestHarness` class.  Take `*node_names` as varargs so tests can
+  pass `t1, t2` or just `t1`.
+
+- [ ] **Step 3: Add baseline values to bench_test_config.yaml.example.**
+  Suggested keys (with defaults):
+  ```yaml
+  baseline_wind_storm_mps: 15
+  baseline_wind_release_mps: 10
+  baseline_storm_dwell_min: 10
+  baseline_track_thresh: 3
+  ```
+
+- [ ] **Step 4: Call `reset_to_baseline_` at the start of every test body.**
+  This includes the currently-passing tests too -- defensive resetting
+  shouldn't hurt their pass/fail outcomes, and it makes the suite robust
+  against any future test that forgets to clean up.
+
+- [ ] **Step 5: Re-run the suite three times** back-to-back.  Expect
+  identical 5-pass-2-skip results on all three runs.
+
+- [ ] **Step 6: Commit**: `test: P5-13 -- per-test state isolation via reset_to_baseline_`
+
+---
+
+## Task P5-14: expect_log default `since` cursor from last action
+
+**Files:**
+- Modify: `tools/bench_test.py`
+
+**Why:** Currently `TestHarness.expect_log(name, pattern, timeout=10)` defaults
+to `since = time.monotonic() - 0.1` -- it only looks back 100 ms.  This breaks
+the very common pattern:
+
+```python
+await h.press_button(t1, "force_park")              # logs hit t2 ~5 ms later
+await h.expect_entity(t1, "mode", "storm", t=15)    # waits up to 15 s
+await h.expect_log(t2, r"mesh rx type=4", t=15)     # back-window = 100 ms -- TOO LATE
+```
+
+`test_force_park_release` and `test_ha_command_propagation` already work
+around this by manually capturing `since_action = time.monotonic()` before
+the trigger and passing `since=since_action` explicitly.  But every new test
+has to remember this footgun, and forgetting it produces non-obvious
+race-condition failures (the line IS in the buffer, just timestamped earlier
+than the cursor).
+
+**Approach:** Add a `_last_action_ts` field on `TestHarness`, updated by every
+action method (`press_button`, `set_switch`, `set_number`, `reboot`,
+`send_uart_cmd` if it stays).  When `expect_log` is called with `since=None`,
+default to `self._last_action_ts` (and fall back to `now - 0.1` if no action
+has been recorded yet).
+
+- [ ] **Step 1: Add `_last_action_ts: float = 0.0` field** to `TestHarness.__init__`.
+
+- [ ] **Step 2: Update every action method** to set
+  `self._last_action_ts = time.monotonic()` as its first statement.
+
+- [ ] **Step 3: Modify `expect_log`** so the `if since is None` branch
+  uses `self._last_action_ts or (time.monotonic() - 0.1)`.
+
+- [ ] **Step 4: Strip the manual `since_action = time.monotonic()` /
+  `since=since_action` boilerplate** from tests that no longer need it.
+  This is `test_force_park_release` lines ~580-590 and
+  `test_ha_command_propagation` lines ~858, ~863, ~876.
+
+- [ ] **Step 5: Re-run the suite.**  Should still pass 5-and-skip-2 with
+  no behavior change (the new default just makes the back-window wider when
+  callers don't specify).
+
+- [ ] **Step 6: Commit**: `test: P5-14 -- expect_log defaults since= to last action timestamp`
 
