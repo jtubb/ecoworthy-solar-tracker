@@ -87,8 +87,11 @@ tracker_bridge:
     channel: 6        # must match wifi: channel: above
     psk: !secret tracker_mesh_psk
     has_wind_sensor: true   # P6-1: this node has the real wind sensor; auto-elected primary
-    peers:
-      - solar-tracker-2   # node_name of the peer (esphome.name in that node's YAML)
+    # Fleet-wide peer list lives in secrets.yaml.  The codegen auto-filters this
+    # node's own esphome.name from the list, so the same secret can be shared
+    # across every tracker in the array -- adding a new tracker means editing
+    # one place (secrets.yaml) + creating its device YAML.
+    peers: !secret tracker_peers
 
 stream_server:
   uart_id: uart_bus
