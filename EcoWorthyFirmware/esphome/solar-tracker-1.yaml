@@ -99,7 +99,9 @@ sensor:
   - platform: wifi_signal
     name: "$friendly_name WiFi Signal"
     update_interval: 60s
-  # T1 (local STC) status sensors
+  # Local STC status sensors.  P5-12: dropped the `peer_id: solar-tracker-2`
+  # mirror block now that tracker-2 has its own STC and publishes its own
+  # native entities on its own ESPHome device.
   - platform: tracker_bridge
     tracker_bridge_id: bridge
     az:
@@ -108,16 +110,6 @@ sensor:
       name: "$friendly_name Elevation %"
     wind:
       name: "$friendly_name Wind"
-  # solar-tracker-2 peer status sensors (published by gateway when its TELEMETRY is received)
-  - platform: tracker_bridge
-    tracker_bridge_id: bridge
-    peer_id: "solar-tracker-2"
-    az:
-      name: "Solar Tracker 2 Azimuth %"
-    el:
-      name: "Solar Tracker 2 Elevation %"
-    wind:
-      name: "Solar Tracker 2 Wind"
 
 text_sensor:
   - platform: wifi_info
@@ -125,17 +117,11 @@ text_sensor:
       name: "$friendly_name IP Address"
   - platform: version
     name: "$friendly_name ESPHome Version"
-  # T1 (local STC) mode
+  # Local STC mode.  P5-12: peer mirror dropped (see comment in sensor block).
   - platform: tracker_bridge
     tracker_bridge_id: bridge
     mode:
       name: "$friendly_name Mode"
-  # solar-tracker-2 peer mode (published by gateway when its TELEMETRY is received)
-  - platform: tracker_bridge
-    tracker_bridge_id: bridge
-    peer_id: "solar-tracker-2"
-    mode:
-      name: "Solar Tracker 2 Mode"
 
 binary_sensor:
   - platform: stream_server
@@ -175,31 +161,6 @@ number:
       min_value: 1
       max_value: 99
       step: 1
-  # solar-tracker-2 peer config.  Moving a slider broadcasts CONFIG SET_REQ over mesh.
-  - platform: tracker_bridge
-    tracker_bridge_id: bridge
-    peer_id: "solar-tracker-2"
-    wind_storm_mps:
-      name: "Solar Tracker 2 Wind Storm"
-      min_value: 5
-      max_value: 30
-      step: 1
-    wind_release_mps:
-      name: "Solar Tracker 2 Wind Release"
-      min_value: 0
-      max_value: 20
-      step: 1
-    storm_dwell_min:
-      name: "Solar Tracker 2 Storm Dwell"
-      min_value: 1
-      max_value: 60
-      step: 1
-    track_thresh:
-      name: "Solar Tracker 2 Track Threshold"
-      min_value: 1
-      max_value: 99
-      step: 1
-
 # --- Bench-test hook: silence outbound traffic without WiFi disconnect --------
 # Turning this ON stops the STC poll, mesh broadcasts, and cfg_poll.
 # The node still receives mesh frames and is reachable via the HA API.

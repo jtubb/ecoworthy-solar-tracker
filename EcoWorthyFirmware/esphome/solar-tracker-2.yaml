@@ -111,6 +111,9 @@ sensor:
   - platform: wifi_signal
     name: "$friendly_name WiFi Signal"
     update_interval: 60s
+  # Local STC status sensors.  P5-12: peer_id: solar-tracker-1 mirror block
+  # dropped (T1 publishes these on its own device now that both nodes have
+  # their own STC).
   - platform: tracker_bridge
     tracker_bridge_id: bridge
     az:
@@ -119,15 +122,6 @@ sensor:
       name: "$friendly_name Elevation %"
     wind:
       name: "$friendly_name Wind"
-  # Mirror of solar-tracker-1 (the real STC node) -- populated when this
-  # tracker is the acting gateway.  Lets HA see T1's data even if T1's API
-  # is briefly unreachable while this one is up.
-  - platform: tracker_bridge
-    tracker_bridge_id: bridge
-    peer_id: solar-tracker-1
-    az:   { name: "Solar Tracker 1 Azimuth %" }
-    el:   { name: "Solar Tracker 1 Elevation %" }
-    wind: { name: "Solar Tracker 1 Wind" }
 
 text_sensor:
   - platform: wifi_info
@@ -139,21 +133,52 @@ text_sensor:
     tracker_bridge_id: bridge
     mode:
       name: "$friendly_name Mode"
-  - platform: tracker_bridge
-    tracker_bridge_id: bridge
-    peer_id: solar-tracker-1
-    mode: { name: "Solar Tracker 1 Mode" }
 
 binary_sensor:
   - platform: stream_server
     connected:
       name: "$friendly_name Stream Server Client Connected"
 
-# --- Bench helper: HA-controllable wind value for the mesh broadcast.
-#     Only meaningful on this no-STC node; remove on real installs.
+# --- Phase 4 command buttons (mesh-broadcast to all trackers) ----------
+# P5-12: tracker-2 now has its own STC, so it needs native operator buttons
+# (matching tracker-1's set).  The mesh broadcast still applies fleet-wide;
+# the buttons just make T2's STC directly addressable from its own HA card.
+button:
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    force_park:    { name: "$friendly_name Force Park" }
+    force_release: { name: "$friendly_name Force Release" }
+    stop:          { name: "$friendly_name Emergency Stop" }
+
+# --- Local STC config sliders (P5-12 -- added with the STC) ----------
+# Moving a slider sends !cfg set id=N val=V over the local UART.  The STC's
+# reply flows through handle_payload_ and republishes the slider state.
 number:
   - platform: tracker_bridge
     tracker_bridge_id: bridge
+    wind_storm_mps:
+      name: "$friendly_name Wind Storm"
+      min_value: 5
+      max_value: 30
+      step: 1
+    wind_release_mps:
+      name: "$friendly_name Wind Release"
+      min_value: 0
+      max_value: 20
+      step: 1
+    storm_dwell_min:
+      name: "$friendly_name Storm Dwell"
+      min_value: 1
+      max_value: 60
+      step: 1
+    track_thresh:
+      name: "$friendly_name Track Threshold"
+      min_value: 1
+      max_value: 99
+      step: 1
+    # Bench helper kept for harness tests that inject synthetic wind
+    # without a real sensor.  Has no effect on a node with a real wind
+    # sensor + has_wind_sensor: true (the next status poll overwrites it).
     wind_override:
       name: "$friendly_name Wind override"
 
