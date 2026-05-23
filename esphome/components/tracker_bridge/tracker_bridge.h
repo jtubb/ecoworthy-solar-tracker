@@ -544,6 +544,12 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * so the STC's storm_check picks the right source automatically. */
   int8_t last_primary_state_{-1};
 
+  /* P5-15: gateway-role observability.  Tracked separately from any
+   * peer-publish side-effect so that the role transition is logged even when
+   * no peer entities exist (which is the post-P5-12 default).  Initialized to
+   * -1 to force a "transition to current state" log on the first tick. */
+  int8_t was_acting_gateway_{-1};
+
   /* --- Mesh config (populated by YAML via setters above) --- */
   uint8_t mesh_channel_{0};
   std::string mesh_psk_{};
@@ -682,6 +688,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       if (WiFi.isConnected()) this->mesh_tx_gateway_hb_();
       this->peers_prune_();
       this->sync_stc_wsrc_to_election_(primary_now);
+      /* P5-15: log gateway role transitions so the bench harness can
+       * identify the acting gateway without depending on peer-publish
+       * side effects (which P5-12 removed).  Logged on STATE CHANGE only
+       * to avoid spamming the log every 5 s. */
+      int8_t gw_now = this->is_acting_gateway_() ? 1 : 0;
+      if (gw_now != was_acting_gateway_) {
+        ESP_LOGI(TAG, "gateway role: %s", gw_now ? "active" : "standby");
+        was_acting_gateway_ = gw_now;
+      }
     });
 
     /* Every 30 s: acting gateway polls each declared remote peer for its 4

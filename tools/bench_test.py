@@ -628,17 +628,34 @@ class TestHarness:
     async def identify_gateway(self) -> Optional[str]:
         """
         Return the name of the currently acting gateway by watching for
-        '[gateway] publish peer' log lines in the next 20 seconds.
-        Returns None if neither node logs that string.
-        """
-        since = time.monotonic()
-        deadline = since + 20.0
-        gw_pat = re.compile(r"\[gateway\]")
+        the firmware's 'gateway role: active' LOGD line (P5-15) on each
+        node.  Scans the existing log ring first (most recent active
+        transition still in buffer), then waits up to 20 s for a new
+        active transition if none is cached.
 
+        Returns None if no node has reported active role within 20 s --
+        usually means the mesh hasn't fully settled yet (e.g. just after
+        boot).
+        """
+        gw_pat = re.compile(r"gateway role: active")
+        # 1. Cache scan: most recent "active" transition still in the ring.
+        candidates: Dict[str, float] = {}
+        for name in self._cfg.nodes:
+            for line in reversed(self._log_ring[name]):
+                if gw_pat.search(str(line)):
+                    candidates[name] = line.ts
+                    break
+        if candidates:
+            # Return whichever node logged "active" most recently; if multiple
+            # have it cached, the freshest wins (role changes are exclusive).
+            return max(candidates, key=candidates.get)
+
+        # 2. Otherwise wait for a fresh active transition.
+        deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
             for name in self._cfg.nodes:
                 for line in self._log_ring[name]:
-                    if line.ts >= since and gw_pat.search(str(line)):
+                    if gw_pat.search(str(line)):
                         return name
             self._log_event.clear()
             remaining = deadline - time.monotonic()
@@ -908,56 +925,39 @@ async def test_dual_primary_election_failover(h: TestHarness) -> None:
 
 async def test_gateway_failover(h: TestHarness) -> None:
     """
-    MANUAL TEST -- broken by P5-12.
+    Identify the acting gateway via the 'gateway role: active' LOGD (P5-15),
+    silence it via Test Offline, then verify the other node's role flips to
+    active within GATEWAY_HB stale time (15 s) + election margin.
 
-    Original premise: silence the acting gateway, verify the other node logs
-    a '[gateway] publish peer' line within ~35 s (election-driven takeover).
-
-    The '[gateway] publish peer' log only fires when the gateway publishes
-    peer-mirror entities.  P5-12 (2026-05-23) removed peer mirrors from both
-    YAMLs because both nodes now have their own STC + native entities.
-    Result: identify_gateway() has no signal to look at and always returns
-    None; the test falls back to assuming t1 is the gateway when election
-    typically picks t2 (lower MAC); silencing the wrong node does nothing.
-
-    Refactor TBD -- needs either:
-      (a) firmware-side: add a periodic `[I] gateway role: active` LOGD on
-          whichever node is the elected gateway, decoupled from peer-mirror
-          publishing.  ~10 line change in tracker_bridge.h.
-      (b) harness-side: parse MAC addresses from `mesh rx type=3` lines on
-          each node, compute the lowest-MAC active node, and assert that
-          when it goes offline the next-lowest takes over.  Doesn't need
-          firmware changes but is more code.
-
-    Recommend (a).  Filed as P5-15 in the deferred-cleanups plan.
+    Failure history: this test was originally broken by P5-12 (removal of
+    peer mirrors took out the '[gateway] publish peer' log line the harness
+    used).  P5-15 added a peer-mirror-independent gateway-role LOGD on every
+    role transition; identify_gateway() and this test now both consume that.
     """
-    if not MANUAL_FLAG:
-        raise _ManualSkip(
-            "Broken by P5-12 -- '[gateway] publish peer' log line no longer "
-            "exists since peer mirrors were dropped.  Refactor TBD (P5-15).  "
-            "Run with --include-manual to attempt the legacy version anyway."
-        )
     t1 = "solar-tracker-1"
     t2 = "solar-tracker-2"
 
     # Let steady-state GATEWAY_HB broadcasts run for a bit
     await h.wait_steady_state(6)
 
-    # Identify acting gateway by watching for '[gateway] publish peer' log lines
+    # Identify acting gateway via the firmware's role LOGD
     gw = await h.identify_gateway()
     if gw is None:
-        # Fallback: assume tracker-1 is gateway (lowest MAC on most installations)
-        gw = t1
+        raise _FailError(
+            "test_gateway_failover: identify_gateway() returned None.  Neither "
+            "node logged 'gateway role: active' within 20 s.  Mesh may not have "
+            "settled, or the P5-15 LOGD hasn't shipped to firmware yet."
+        )
     other = t2 if gw == t1 else t1
 
     # Silence the gateway
-    since_offline = time.monotonic()
     await h.set_switch(gw, "test_offline_switch", True)
 
     try:
         # GATEWAY_HB stale = 15 s (3 missed @ 5s).  Allow 35 s for the other
-        # node to observe the stale + win the next election.
-        await h.expect_log(other, r"\[gateway\]", timeout=35.0, since=since_offline)
+        # node to observe the stale + win the next election + log the
+        # transition.
+        await h.expect_log(other, r"gateway role: active", timeout=35.0)
 
     finally:
         # Restore original gateway
