@@ -208,6 +208,12 @@ class TestHarness:
         self._log_event = asyncio.Event()
         # asyncio event that fires whenever any entity state changes
         self._state_event = asyncio.Event()
+        # P5-14: timestamp of the most recent harness action (press_button /
+        # set_switch / set_number / reboot).  expect_log defaults its `since=`
+        # cursor to this value when not explicitly passed, so a log line that
+        # arrives just after the action but before the next expect call isn't
+        # filtered out by the previous 100 ms back-window.
+        self._last_action_ts: float = 0.0
 
     # ------------------------------------------------------------------
     # Connection management
@@ -380,14 +386,17 @@ class TestHarness:
         info = self._resolve_entity_or_fail("press_button", name, entity_object_id)
         # aioesphomeapi's *_command methods are synchronous fire-and-forget;
         # they enqueue a request frame and return None, not a coroutine.
+        self._last_action_ts = time.monotonic()
         self._clients[name].button_command(info.key)
 
     async def set_switch(self, name: str, entity_object_id: str, value: bool) -> None:
         info = self._resolve_entity_or_fail("set_switch", name, entity_object_id)
+        self._last_action_ts = time.monotonic()
         self._clients[name].switch_command(info.key, value)
 
     async def set_number(self, name: str, entity_object_id: str, value: float) -> None:
         info = self._resolve_entity_or_fail("set_number", name, entity_object_id)
+        self._last_action_ts = time.monotonic()
         self._clients[name].number_command(info.key, value)
 
     async def reboot(self, name: str) -> None:
@@ -499,7 +508,11 @@ class TestHarness:
         re_pat = re.compile(pattern)
         deadline = time.monotonic() + timeout
         if since is None:
-            since = time.monotonic() - 0.1  # accept lines arriving right now
+            # P5-14: default to the most-recent harness action timestamp, so a
+            # log line that arrived between an action (press_button etc.) and
+            # this expect_log call doesn't age out of the back-window.  Falls
+            # back to a 100 ms grace if no action has been recorded yet.
+            since = self._last_action_ts or (time.monotonic() - 0.1)
 
         while True:
             # Scan the current ring buffer
@@ -674,19 +687,17 @@ async def test_force_park_release(h: TestHarness) -> None:
 
     try:
         # --- Press Force Park ---
-        # Capture the cursor BEFORE the button press: expect_log defaults to a
-        # 100 ms back-window, but the t2 'mesh rx type=4' arrives within
-        # milliseconds of the press, while expect_entity below can take several
-        # seconds.  Without an explicit since=, the log line ages out of the
-        # window before we look for it.
-        since_park = time.monotonic()
+        # P5-14: harness auto-tracks _last_action_ts on press_button et al.;
+        # expect_log defaults its since= to that, so the mesh-rx log line
+        # arriving milliseconds after the press is still in-window even if
+        # the intervening expect_entity takes several seconds.
         await h.press_button(t1, "force_park")
 
         # Tracker-1 STC should enter storm
         await h.expect_entity(t1, "mode", "storm", timeout=15)
 
         # Tracker-2 should relay the mesh command (no STC, so check mesh rx log)
-        await h.expect_log(t2, r"mesh rx type=4", timeout=15, since=since_park)
+        await h.expect_log(t2, r"mesh rx type=4", timeout=15)
 
         # --- Press Force Release ---
         since_release = time.monotonic()
@@ -982,28 +993,22 @@ async def test_ha_command_propagation(h: TestHarness) -> None:
     await h.set_number(t1, "storm_dwell_min", float(test_dwell))
     await asyncio.sleep(2)
 
-    since_park = time.monotonic()
-
     try:
         # Press Force Park
+        # P5-14: expect_log defaults since= to _last_action_ts (the press_button
+        # below), so log lines arriving milliseconds after the press are
+        # in-window for subsequent expect_log calls.
         await h.press_button(t1, "force_park")
 
         # Mesh command should arrive at tracker-2
-        await h.expect_log(
-            t2, r"mesh rx type=4", timeout=15.0, since=since_park
-        )
+        await h.expect_log(t2, r"mesh rx type=4", timeout=15.0)
 
         # tracker_bridge's own LOGD line confirms the command was framed and
         # written to the STC UART.  This asserts on the production interface,
         # not on the optional `uart: debug:` hex tap (which competes with the
         # bridge for the UART RX buffer -- see docs/superpowers/plans/2026-05-21
         # -phase-5-deferred-cleanups.md, P5-11 background).
-        await h.expect_log(
-            t1,
-            r"cmd->STC: !park",
-            timeout=10.0,
-            since=since_park,
-        )
+        await h.expect_log(t1, r"cmd->STC: !park", timeout=10.0)
 
         # Press Force Release
         since_release = time.monotonic()
