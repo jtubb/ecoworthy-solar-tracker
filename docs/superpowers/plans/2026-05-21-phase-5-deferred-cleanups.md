@@ -29,6 +29,7 @@ rweather/Crypto + AES-128-GCM (ESP).
 | P5-9 | Wind override slider gated by `local_role` | Low | Trivial | Low | Hides bench-helper from STC-equipped nodes |
 | P5-10 | Schema validate `esphome.name <= 31 chars` at codegen | Low | Low | Low | Catch the truncation case before runtime warn |
 | P5-11 | Stagger cfg_poll burst to avoid half-duplex collision | Med | Trivial | Low | One of four cfg reads is dropped each 30 s cycle |
+| P5-12 | YAML migration when tracker-2 gets its own STC | Med | Low | Low | Drop tracker-1's peer mirrors for clean entity_ids |
 
 (P5-8 — ESPHome dashboard bind-mount workflow doc — was dropped from scope.)
 
@@ -545,4 +546,155 @@ collision.
   no missing IDs across multiple consecutive cycles.
 
 - [ ] **Step 5: Commit**: `fix(esp): P5-11 -- stagger cfg_poll burst by 150 ms to avoid half-duplex collision`
+
+---
+
+## Task P5-12: YAML migration when tracker-2 gets its own STC
+
+**Files:**
+- Modify: `EcoWorthyFirmware/esphome/solar-tracker-1.yaml`
+- (Optional) Modify: `EcoWorthyFirmware/esphome/solar-tracker-2.yaml`
+
+**Status before this task:** Tracker-2 has no STC, so its local STC entity blocks
+(already declared in `solar-tracker-2.yaml` lines 114-121 and 138-141) stay empty.
+Tracker-1 publishes mirror entities for tracker-2 (via `peer_id: solar-tracker-2`
+blocks) when it is the acting gateway -- this is the only way HA sees tracker-2's
+state today.  The mirror entity_id is awkward: `sensor.solar_tracker_1_solar_tracker_2_azimuth_pct`
+(both device-slug and entity-name-slug prefix the same fact).
+
+**Trigger:** Run this task only after physically connecting an STC15F2K60S2 board
+to solar-tracker-2 and flashing it with the standard tracker firmware (same
+`EcoWorthyFirmware/` build that tracker-1 runs).  Verify the new STC responds to
+`!cfg get id=1` via the local UART on tracker-2 before touching the YAML.
+
+**Why:** With both nodes locally connected to STCs, tracker-2's native entity
+blocks become populated and the peer mirrors on tracker-1 become redundant.  HA
+gets one clean entity per fact, owned by the device that owns the hardware.
+
+**Trade-off documented for the future-you:** the peer mirrors were originally
+intended as cross-node failover view -- if tracker-1's API briefly drops while
+mesh is still up, tracker-2's mirror (when it was acting gateway) gave HA a
+backup window into tracker-1's state.  Dropping the mirrors removes that
+secondary view.  In practice WiFi/API outages are bursty enough that the mesh
+itself goes silent when the API does, so the failover view rarely covers a
+real outage; the entity_id ugliness is the bigger ongoing cost.  If you want
+to keep the failover view, leave the mirrors in and just rename their
+entity_ids via the HA UI (the friendly names are already correct).
+
+- [ ] **Step 1: Verify tracker-2's STC is alive.** Run the bench harness on
+  `solar-tracker-2`:
+  ```
+  python tools/bench_test.py --test test_cfg_get_resp_readback
+  ```
+  Adjust the test temporarily to target tracker-2 (or just check the boot log
+  for `handle_payload_ p='cfg id=1 val=N'` lines on the tracker-2 ESPHome log
+  stream).  All four sliders should populate within ~30 s.  If they don't,
+  STOP and debug the new STC's UART wiring before touching any YAML.
+
+- [ ] **Step 2: Drop the peer_id blocks from solar-tracker-1.yaml.** Remove
+  the following three blocks (line numbers approximate):
+
+  Sensor block (~lines 112-120):
+  ```yaml
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: "solar-tracker-2"
+    az:   { name: "Solar Tracker 2 Azimuth %" }
+    el:   { name: "Solar Tracker 2 Elevation %" }
+    wind: { name: "Solar Tracker 2 Wind" }
+  ```
+
+  Text_sensor block (~lines 134-138):
+  ```yaml
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: "solar-tracker-2"
+    mode: { name: "Solar Tracker 2 Mode" }
+  ```
+
+  Number slider block (~lines 179-201):
+  ```yaml
+  - platform: tracker_bridge
+    tracker_bridge_id: bridge
+    peer_id: "solar-tracker-2"
+    wind_storm_mps:   { name: "Solar Tracker 2 Wind Storm", ... }
+    wind_release_mps: { name: "Solar Tracker 2 Wind Release", ... }
+    storm_dwell_min:  { name: "Solar Tracker 2 Storm Dwell", ... }
+    track_thresh:     { name: "Solar Tracker 2 Track Threshold", ... }
+  ```
+
+- [ ] **Step 3: Decide on the peer mirrors in solar-tracker-2.yaml.**
+  Tracker-2 has equivalent mirrors of tracker-1 (lines 125-130 and 142-145).
+  By symmetry, drop them too unless you want the failover-view trade-off
+  described above.  Default recommendation: drop.
+
+- [ ] **Step 4: Add the missing per-node config sliders to solar-tracker-2.yaml.**
+  Tracker-2 currently has NO local `wind_storm_mps`/`wind_release_mps`/`storm_dwell_min`/
+  `track_thresh` number blocks (no local STC meant no sliders to wire).  Add them
+  now, mirroring solar-tracker-1.yaml's local-STC number block (~lines 154-177):
+  ```yaml
+  number:
+    - platform: tracker_bridge
+      tracker_bridge_id: bridge
+      wind_storm_mps:
+        name: "$friendly_name Wind Storm"
+        min_value: 5
+        max_value: 30
+        step: 1
+      wind_release_mps:
+        name: "$friendly_name Wind Release"
+        min_value: 0
+        max_value: 20
+        step: 1
+      storm_dwell_min:
+        name: "$friendly_name Storm Dwell"
+        min_value: 1
+        max_value: 60
+        step: 1
+      track_thresh:
+        name: "$friendly_name Track Threshold"
+        min_value: 1
+        max_value: 99
+        step: 1
+  ```
+  Keep the `wind_override:` bench-helper number block too if it's still useful;
+  otherwise drop it (a real STC now provides real wind via the sensor, so the
+  helper is mostly redundant on this node).
+
+- [ ] **Step 5: Add the missing operator buttons to solar-tracker-2.yaml.**
+  Mirror solar-tracker-1.yaml's button block (~lines 146-151):
+  ```yaml
+  button:
+    - platform: tracker_bridge
+      tracker_bridge_id: bridge
+      force_park:    { name: "$friendly_name Force Park" }
+      force_release: { name: "$friendly_name Force Release" }
+      stop:          { name: "$friendly_name Emergency Stop" }
+  ```
+
+- [ ] **Step 6: Flip tracker-2's has_wind_sensor flag if appropriate.**
+  Only if the new STC has a real wind sensor physically attached: edit
+  `solar-tracker-2.yaml` line 101 `has_wind_sensor: false` → `true`.  The
+  election will then race lowest-MAC between t1 and t2.  Leave as `false`
+  if t2's STC has no sensor and just receives WIND broadcasts from t1.
+
+- [ ] **Step 7: Flash both nodes.** Build via the dashboard (or
+  `esphome run EcoWorthyFirmware/esphome/solar-tracker-{1,2}.yaml`).  After
+  reflash, both devices should appear as independent ESPHome devices in HA
+  with clean entity_ids:
+  - `sensor.solar_tracker_1_azimuth_pct`
+  - `sensor.solar_tracker_2_azimuth_pct`
+  - matching for el / wind / mode / wind_storm / wind_release / storm_dwell / track_thresh
+
+- [ ] **Step 8: Clean up stale HA entities.** Settings -> Devices & Services
+  -> ESPHome -> solar-tracker-1 -> remove the now-orphaned
+  `sensor.solar_tracker_1_solar_tracker_2_*` entities if HA didn't auto-cull
+  them.
+
+- [ ] **Step 9: Re-run the bench harness.** All 5 automated tests should
+  still pass.  test_no_primary_baseline and test_dual_primary_election_failover
+  may now be exercisable as automated tests instead of manual-gated ones,
+  depending on Step 6's decision -- update their gates if applicable.
+
+- [ ] **Step 10: Commit**: `feat(yaml): P5-12 -- migrate to per-device entities now that tracker-2 has STC`
 
