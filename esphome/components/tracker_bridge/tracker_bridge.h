@@ -1434,6 +1434,10 @@ class ConfigNumber : public number::Number {
 
  protected:
   void control(float value) override {
+    /* DEBUG: log every control() call so the bench harness can see when
+     * an HA SET is actually reaching this entity.  Drop after diagnosing. */
+    ESP_LOGD("tracker_bridge", "ConfigNumber::control fid=%u peer='%s' val=%.2f parent=%p",
+             (unsigned) field_id_, peer_id_.c_str(), value, (void*) parent_);
     if (parent_ == nullptr) return;
     /* Clamp to uint8 range before sending; slider min/max enforced by ESPHome */
     uint8_t v = (value < 0.0f) ? 0 : (value > 255.0f) ? 255 : (uint8_t)value;
