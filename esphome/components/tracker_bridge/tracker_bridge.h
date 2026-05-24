@@ -148,6 +148,28 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     if (it != peer_decls_.end()) { it->second.track_thresh = n; return; }
     ESP_LOGW(TAG, "set_track_thresh_number_for: unknown peer_id '%s'", peer_id.c_str());
   }
+  /* Night-park: local-only setters (no peer-level entities for v1).
+   * Includes night_park_enable as a number 0/1 (no switch platform). */
+  void set_night_park_en_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_night_park_en_num_ = n; return; }
+    ESP_LOGW(TAG, "set_night_park_en_number_for: peer_id not supported for night-park (v1)");
+  }
+  void set_night_park_az_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_night_park_az_num_ = n; return; }
+    ESP_LOGW(TAG, "set_night_park_az_number_for: peer_id not supported for night-park (v1)");
+  }
+  void set_night_park_el_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_night_park_el_num_ = n; return; }
+    ESP_LOGW(TAG, "set_night_park_el_number_for: peer_id not supported for night-park (v1)");
+  }
+  void set_night_park_min_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_night_park_min_num_ = n; return; }
+    ESP_LOGW(TAG, "set_night_park_min_number_for: peer_id not supported for night-park (v1)");
+  }
+  void set_night_park_thr_number_for(const std::string &peer_id, number::Number *n) {
+    if (peer_id.empty()) { local_night_park_thr_num_ = n; return; }
+    ESP_LOGW(TAG, "set_night_park_thr_number_for: peer_id not supported for night-park (v1)");
+  }
 #endif
 
   /* --- Peer registration (called from __init__.py to_code for each declared peer) --- */
@@ -203,6 +225,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
    * diagnostic) so the bench_test.py harness can drive it via the native API.
    * Default: false (off).  Safe to leave compiled in on production nodes. */
   void set_test_offline(bool v) { test_offline_ = v; }
+
+  /* Night-park bench hook: send !sim_dark on/off over the UART so the
+   * STC forces its sun-average reading to 0, engaging the dark timer
+   * without needing to physically occlude the sensors.  Called from the
+   * 'Sim Dark' template switch in each tracker's YAML. */
+  void night_park_set_sim_dark(bool on) {
+    const char *cmd = on ? "!sim_dark on" : "!sim_dark off";
+    write_str_frame_(cmd);
+  }
 
   /* Bench-helper write path for the wind cache.  Used by the optional
    * WindOverrideNumber to inject synthetic wind values on a node with
@@ -403,12 +434,12 @@ class TrackerBridge : public Component, public uart::UARTDevice {
         if (key == "id")       cfg_id  = std::atoi(val.c_str());
         else if (key == "val") cfg_val = std::atoi(val.c_str());
       }
-      /* Accept fields 1-4 (config sliders).
+      /* Accept fields 1-4 (storm/track sliders) and 5-9 (night-park).
        * Field 32 (CFG_F_ROLE) is no longer used by the ESP side: wind primary
        * is determined by the has_wind_sensor capability bit (P6-1).
        * The STC's role EEPROM byte still controls STC-side wind_source behavior;
        * the ESP simply ignores field-32 replies from this firmware version on. */
-      bool known_field = (cfg_id >= 1 && cfg_id <= 4);
+      bool known_field = (cfg_id >= 1 && cfg_id <= 9);
       if (!known_field || cfg_val < 0) {
         ESP_LOGD(TAG, "cfg reply ignored: id=%d val=%d", cfg_id, cfg_val);
         return;
@@ -417,15 +448,20 @@ class TrackerBridge : public Component, public uart::UARTDevice {
       uint8_t fval = (uint8_t)(cfg_val > 255 ? 255 : cfg_val);
       ESP_LOGD(TAG, "cfg reply: fid=%u val=%u", (unsigned)fid, (unsigned)fval);
 
-      /* Fields 1-4: publish to the local slider (if wired). */
+      /* Fields 1-9: publish to the local slider (if wired). */
 #ifdef USE_NUMBER
       {
         number::Number *local_num = nullptr;
         switch (fid) {
-          case 1: local_num = local_wind_storm_num_;   break;  /* CFG_F_WIND_STORM */
-          case 2: local_num = local_wind_release_num_; break;  /* CFG_F_WIND_RELEASE */
-          case 3: local_num = local_storm_dwell_num_;  break;  /* CFG_F_STORM_DWELL */
-          case 4: local_num = local_track_thresh_num_; break;  /* CFG_F_TRACK_THRESH */
+          case 1: local_num = local_wind_storm_num_;     break;  /* CFG_F_WIND_STORM */
+          case 2: local_num = local_wind_release_num_;   break;  /* CFG_F_WIND_RELEASE */
+          case 3: local_num = local_storm_dwell_num_;    break;  /* CFG_F_STORM_DWELL */
+          case 4: local_num = local_track_thresh_num_;   break;  /* CFG_F_TRACK_THRESH */
+          case 5: local_num = local_night_park_en_num_;  break;  /* CFG_F_NIGHT_PARK_EN */
+          case 6: local_num = local_night_park_az_num_;  break;  /* CFG_F_NIGHT_PARK_AZ */
+          case 7: local_num = local_night_park_el_num_;  break;  /* CFG_F_NIGHT_PARK_EL */
+          case 8: local_num = local_night_park_min_num_; break;  /* CFG_F_NIGHT_PARK_MIN */
+          case 9: local_num = local_night_park_thr_num_; break;  /* CFG_F_NIGHT_PARK_THR */
         }
         if (local_num) local_num->publish_state(float(fval));
       }
@@ -491,6 +527,14 @@ class TrackerBridge : public Component, public uart::UARTDevice {
   number::Number *local_wind_release_num_{nullptr};
   number::Number *local_storm_dwell_num_{nullptr};
   number::Number *local_track_thresh_num_{nullptr};
+  /* Night-park config sliders (cfg field IDs 0x05-0x09).  Enable uses a
+   * number 0/1 rather than a switch -- avoids a new platform file and the
+   * read-back path is identical to the other sliders. */
+  number::Number *local_night_park_en_num_{nullptr};
+  number::Number *local_night_park_az_num_{nullptr};
+  number::Number *local_night_park_el_num_{nullptr};
+  number::Number *local_night_park_min_num_{nullptr};
+  number::Number *local_night_park_thr_num_{nullptr};
 #endif
 
   /* ================================================================
@@ -742,14 +786,17 @@ class TrackerBridge : public Component, public uart::UARTDevice {
        * The STC reply flows through handle_payload_ which publishes the
        * local slider and, if mesh is up, broadcasts GET_RESP for peers.
        *
-       * P5-11: stagger the four !cfg get sends by 150 ms each.  Issuing
-       * them back-to-back overflows the half-duplex single-wire bus:
-       * the STC starts replying after parsing frame 1 while the ESP is
-       * still TXing frames 3/4, and the collision drops one reply (id=3
-       * in observed bench logs).  150 ms is ~7x per-frame airtime at
-       * 9600 baud, plenty for the STC reply to land before the next
-       * request goes out. */
-      for (uint8_t i = 0; i < 4; i++) {
+       * P5-11: stagger the !cfg get sends by 150 ms each.  Issuing them
+       * back-to-back overflows the half-duplex single-wire bus: the STC
+       * starts replying after parsing frame 1 while the ESP is still
+       * TXing later frames, and the collision drops one or more replies.
+       * 150 ms is ~7x per-frame airtime at 9600 baud, plenty for the
+       * STC reply to land before the next request goes out.
+       *
+       * Fields 1-4: storm/track sliders.  Fields 5-9: night-park sliders.
+       * Total burst time: 9 * 150 = 1.35 s, well under cfg_poll's 30 s
+       * cadence. */
+      for (uint8_t i = 0; i < 9; i++) {
         uint8_t fid = uint8_t(i + 1);
         this->set_timeout(uint32_t(i) * 150u, [this, fid]() {
           char buf[20];

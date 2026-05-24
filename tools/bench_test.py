@@ -954,10 +954,13 @@ async def test_gateway_failover(h: TestHarness) -> None:
     await h.set_switch(gw, "test_offline_switch", True)
 
     try:
-        # GATEWAY_HB stale = 15 s (3 missed @ 5s).  Allow 35 s for the other
-        # node to observe the stale + win the next election + log the
-        # transition.
-        await h.expect_log(other, r"gateway role: active", timeout=35.0)
+        # PEER_STALE_MS = 60 s in firmware (12 missed HBs @ 5s).  The other
+        # node won't consider the silenced gateway stale until after that.
+        # Allow 80 s = 60 + one extra mesh_broadcasts cycle + margin for the
+        # role-transition LOGD to fire.  The old 35 s budget was based on a
+        # pre-P5-15 era where stale was 15 s (3 missed @ 5s) -- the firmware
+        # constant has since been bumped without updating this test.
+        await h.expect_log(other, r"gateway role: active", timeout=80.0)
 
     finally:
         # Restore original gateway
@@ -1081,18 +1084,86 @@ async def test_cfg_get_resp_readback(h: TestHarness) -> None:
 # Test registry
 # ---------------------------------------------------------------------------
 
+async def test_night_park_engages_after_dark_timer(h: TestHarness) -> None:
+    """
+    Set dark_min to 1 minute, turn on Sim Dark, verify mode transitions to
+    "night" within ~80 s.  Restore in finally.
+    """
+    t1 = "solar-tracker-1"
+    orig_dark_min = h._entity_state[t1].get("night_park_dark_min")
+    orig_enable   = h._entity_state[t1].get("night_park_enable")
+    await h.set_number(t1, "night_park_enable", 1.0)
+    await h.set_number(t1, "night_park_dark_min", 1.0)
+    await asyncio.sleep(2)
+    try:
+        await h.set_switch(t1, "sim_dark_switch", True)
+        await h.expect_entity(t1, "mode", "night", timeout=80)
+    finally:
+        try:
+            await h.set_switch(t1, "sim_dark_switch", False)
+        except Exception:
+            pass
+        if orig_dark_min is not None:
+            try:
+                await h.set_number(t1, "night_park_dark_min", float(orig_dark_min))
+            except Exception:
+                pass
+        if orig_enable is not None:
+            try:
+                await h.set_number(t1, "night_park_enable", float(orig_enable))
+            except Exception:
+                pass
+
+
+async def test_night_park_releases_on_light_return(h: TestHarness) -> None:
+    """
+    Engage night-park via sim_dark, then turn sim_dark off and verify mode
+    returns to "track" within ~90 s (6 consecutive ~10s bright samples
+    + margin).  Storm preemption is exercised separately by force_park
+    tests.
+    """
+    t1 = "solar-tracker-1"
+    orig_dark_min = h._entity_state[t1].get("night_park_dark_min")
+    orig_enable   = h._entity_state[t1].get("night_park_enable")
+    await h.set_number(t1, "night_park_enable", 1.0)
+    await h.set_number(t1, "night_park_dark_min", 1.0)
+    await asyncio.sleep(2)
+    try:
+        await h.set_switch(t1, "sim_dark_switch", True)
+        await h.expect_entity(t1, "mode", "night", timeout=80)
+        await h.set_switch(t1, "sim_dark_switch", False)
+        await h.expect_entity(t1, "mode", "track", timeout=90)
+    finally:
+        try:
+            await h.set_switch(t1, "sim_dark_switch", False)
+        except Exception:
+            pass
+        if orig_dark_min is not None:
+            try:
+                await h.set_number(t1, "night_park_dark_min", float(orig_dark_min))
+            except Exception:
+                pass
+        if orig_enable is not None:
+            try:
+                await h.set_number(t1, "night_park_enable", float(orig_enable))
+            except Exception:
+                pass
+
+
 class _ManualSkip(Exception):
     """Raised by manual tests when --include-manual is not set."""
 
 
 ALL_TESTS: List[Tuple[str, Callable]] = [
-    ("test_force_park_release",          test_force_park_release),
-    ("test_wsrc_failsafe_recovery",      test_wsrc_failsafe_recovery),
-    ("test_no_primary_baseline",         test_no_primary_baseline),
-    ("test_dual_primary_election_failover", test_dual_primary_election_failover),
-    ("test_gateway_failover",            test_gateway_failover),
-    ("test_ha_command_propagation",      test_ha_command_propagation),
-    ("test_cfg_get_resp_readback",       test_cfg_get_resp_readback),
+    ("test_force_park_release",                  test_force_park_release),
+    ("test_wsrc_failsafe_recovery",              test_wsrc_failsafe_recovery),
+    ("test_no_primary_baseline",                 test_no_primary_baseline),
+    ("test_dual_primary_election_failover",      test_dual_primary_election_failover),
+    ("test_gateway_failover",                    test_gateway_failover),
+    ("test_ha_command_propagation",              test_ha_command_propagation),
+    ("test_cfg_get_resp_readback",               test_cfg_get_resp_readback),
+    ("test_night_park_engages_after_dark_timer", test_night_park_engages_after_dark_timer),
+    ("test_night_park_releases_on_light_return", test_night_park_releases_on_light_return),
 ]
 
 

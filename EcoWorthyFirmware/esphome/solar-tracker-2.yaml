@@ -170,6 +170,32 @@ number:
       min_value: 1
       max_value: 99
       step: 1
+    # --- Night-park config (cfg field IDs 0x05-0x09) ---
+    night_park_enable:
+      name: "$friendly_name Night Park Enable"
+      min_value: 0
+      max_value: 1
+      step: 1
+    night_park_az_pct:
+      name: "$friendly_name Night Park East"
+      min_value: 0
+      max_value: 100
+      step: 1
+    night_park_el_pct:
+      name: "$friendly_name Night Park Tilt"
+      min_value: 0
+      max_value: 100
+      step: 1
+    night_park_dark_min:
+      name: "$friendly_name Night Park Dark Minutes"
+      min_value: 1
+      max_value: 120
+      step: 1
+    night_park_dark_thr:
+      name: "$friendly_name Night Park Dark Threshold"
+      min_value: 5
+      max_value: 200
+      step: 1
     # Bench helper kept for harness tests that inject synthetic wind
     # without a real sensor.  Has no effect on a node with a real wind
     # sensor + has_wind_sensor: true (the next status poll overwrites it).
@@ -190,6 +216,16 @@ switch:
       - lambda: id(bridge).set_test_offline(true);
     turn_off_action:
       - lambda: id(bridge).set_test_offline(false);
+  - platform: template
+    name: "$friendly_name Sim Dark"
+    id: sim_dark_switch
+    optimistic: true
+    entity_category: diagnostic
+    icon: mdi:weather-night
+    turn_on_action:
+      - lambda: id(bridge).night_park_set_sim_dark(true);
+    turn_off_action:
+      - lambda: id(bridge).night_park_set_sim_dark(false);
 
 # --- Debug: runtime baud-rate select (leave at 9600 unless debugging) --
 select:

@@ -504,6 +504,11 @@ static void config_valid_refresh(void) { cfg_valid = config_is_valid(); }
  *   11    : track_thresh -- sun differential ADC counts to trigger a move
  *   12    : role (1=primary, 2=secondary)
  *   13    : wind_source (0=local, 1=remote)
+ *   14    : night_park_enable (0 or 1)
+ *   15    : night_park_az_pct (0..100; 100 = full east per CLAUDE.md quirk 5)
+ *   16    : night_park_el_pct (0..100; 50 = flat)
+ *   17    : night_park_dark_min (1..120; minutes of darkness before parking)
+ *   18    : night_park_dark_thr (5..200; per-sensor ADC threshold for "dark")
  */
 static unsigned int ns_stroke_ms = 0;
 static unsigned int ew_stroke_ms = 0;
@@ -515,6 +520,17 @@ static unsigned char storm_dwell_min  = 10;
 static unsigned char track_thresh     = 3;
 static unsigned char role           = 2;   /* 1=primary, 2=secondary */
 static unsigned char wind_source    = 0;   /* 0=local, 1=remote */
+static unsigned char night_park_enable   = 1;
+/* Park targets are interpreted by the existing goto framework: az_target_pct
+ * drives the EW axis, el_target_pct drives the NS axis.  Per CLAUDE.md
+ * quirk 5 ("extending an actuator always moves the panel toward N or E"),
+ * az_pct = 100 corresponds to fully-extended EW = east-rotation extreme.
+ * If your install has the EW actuator wired in reverse, set az_pct = 0
+ * via the HA slider after install. */
+static unsigned char night_park_az_pct   = 100;  /* full east */
+static unsigned char night_park_el_pct   = 50;   /* flat */
+static unsigned char night_park_dark_min = 30;
+static unsigned char night_park_dark_thr = 30;
 
 /* Setting range bounds.  Used by ST_SETTINGS_EDIT for clamping and
  * by config_load() for sanity-checking unprogrammed EEPROM bytes. */
@@ -530,20 +546,29 @@ static unsigned char wind_source    = 0;   /* 0=local, 1=remote */
 #define ROLE_MAX          2
 #define WIND_SOURCE_MIN   0
 #define WIND_SOURCE_MAX   1
+#define NIGHT_PARK_DARK_MIN_MIN   1
+#define NIGHT_PARK_DARK_MIN_MAX 120
+#define NIGHT_PARK_DARK_THR_MIN   5
+#define NIGHT_PARK_DARK_THR_MAX 200
 
 /* Mesh config-protocol field IDs (see P4-6).  RW fields are operator
  * tunables; RO fields are calibration/install data that should only
  * be changed from the local UI. */
-#define CFG_F_WIND_STORM    0x01
-#define CFG_F_WIND_RELEASE  0x02
-#define CFG_F_STORM_DWELL   0x03
-#define CFG_F_TRACK_THRESH  0x04
-#define CFG_F_NS_STROKE     0x10
-#define CFG_F_EW_STROKE     0x11
-#define CFG_F_HORIZ_NS      0x12
-#define CFG_F_HORIZ_EW      0x13
-#define CFG_F_ROLE          0x20
-#define CFG_F_WIND_SOURCE   0x21
+#define CFG_F_WIND_STORM       0x01
+#define CFG_F_WIND_RELEASE     0x02
+#define CFG_F_STORM_DWELL      0x03
+#define CFG_F_TRACK_THRESH     0x04
+#define CFG_F_NIGHT_PARK_EN    0x05
+#define CFG_F_NIGHT_PARK_AZ    0x06
+#define CFG_F_NIGHT_PARK_EL    0x07
+#define CFG_F_NIGHT_PARK_MIN   0x08
+#define CFG_F_NIGHT_PARK_THR   0x09
+#define CFG_F_NS_STROKE        0x10
+#define CFG_F_EW_STROKE        0x11
+#define CFG_F_HORIZ_NS         0x12
+#define CFG_F_HORIZ_EW         0x13
+#define CFG_F_ROLE             0x20
+#define CFG_F_WIND_SOURCE      0x21
 
 #define CFG_STATUS_OK       0
 #define CFG_STATUS_RO       1
@@ -568,6 +593,11 @@ static void config_load(void) {
     track_thresh     = iap_read_byte(EEPROM_BASE + 11);
     role        = iap_read_byte(EEPROM_BASE + 12);
     wind_source = iap_read_byte(EEPROM_BASE + 13);
+    night_park_enable   = iap_read_byte(EEPROM_BASE + 14);
+    night_park_az_pct   = iap_read_byte(EEPROM_BASE + 15);
+    night_park_el_pct   = iap_read_byte(EEPROM_BASE + 16);
+    night_park_dark_min = iap_read_byte(EEPROM_BASE + 17);
+    night_park_dark_thr = iap_read_byte(EEPROM_BASE + 18);
     if (horiz_ns_pct > 100) horiz_ns_pct = 50;
     if (horiz_ew_pct > 100) horiz_ew_pct = 50;
     /* Reject unprogrammed (0xFF) and out-of-range; revert to defaults. */
@@ -581,6 +611,13 @@ static void config_load(void) {
         track_thresh = 3;
     if (role < ROLE_MIN || role > ROLE_MAX) role = 2;             /* default secondary */
     if (wind_source > WIND_SOURCE_MAX) wind_source = 0;           /* default local */
+    if (night_park_enable > 1) night_park_enable = 1;
+    if (night_park_az_pct > 100) night_park_az_pct = 100;
+    if (night_park_el_pct > 100) night_park_el_pct = 50;
+    if (night_park_dark_min < NIGHT_PARK_DARK_MIN_MIN || night_park_dark_min > NIGHT_PARK_DARK_MIN_MAX)
+        night_park_dark_min = 30;
+    if (night_park_dark_thr < NIGHT_PARK_DARK_THR_MIN || night_park_dark_thr > NIGHT_PARK_DARK_THR_MAX)
+        night_park_dark_thr = 30;
     /* Invariant: release threshold must be strictly less than storm threshold. */
     if (wind_release_mps >= wind_storm_mps)
         wind_release_mps = (wind_storm_mps > 0) ? wind_storm_mps - 1 : 0;
@@ -607,6 +644,11 @@ static void config_save(void) {
     iap_program_byte(EEPROM_BASE + 11, track_thresh);
     iap_program_byte(EEPROM_BASE + 12, role);
     iap_program_byte(EEPROM_BASE + 13, wind_source);
+    iap_program_byte(EEPROM_BASE + 14, night_park_enable);
+    iap_program_byte(EEPROM_BASE + 15, night_park_az_pct);
+    iap_program_byte(EEPROM_BASE + 16, night_park_el_pct);
+    iap_program_byte(EEPROM_BASE + 17, night_park_dark_min);
+    iap_program_byte(EEPROM_BASE + 18, night_park_dark_thr);
     config_valid_refresh();   /* config now persisted -> cache fresh */
 }
 
@@ -791,6 +833,21 @@ typedef enum { STORM_PARKING = 0, STORM_HOLDING } storm_phase_t;
 static __xdata storm_phase_t storm_phase = STORM_PARKING;
 static __xdata unsigned long storm_dwell_start_ms = 0;
 static __xdata unsigned char storm_parking = 0;
+
+/* Night-park (autonomous low-light parking).  ST_TRACK arms the dark
+ * timer when read_sun_avg_() drops below night_park_dark_thr; once the
+ * timer hits night_park_dark_min minutes, transition to ST_NIGHT_PARK
+ * and seek the configured east+flat target.  Wake-up: any sun_avg
+ * above (dark_thr + NIGHT_WAKE_HYSTERESIS) for NIGHT_WAKE_STREAK
+ * consecutive samples returns to ST_TRACK.  See night_park_tick(). */
+static __xdata unsigned long night_dark_start_ms = 0;
+static __xdata unsigned char night_dark_armed = 0;
+static __xdata unsigned char night_light_streak = 0;
+static __xdata unsigned long night_last_light_check_ms = 0;
+static __xdata unsigned char sim_dark_active = 0;   /* !sim_dark bench hook */
+#define NIGHT_WAKE_HYSTERESIS  20    /* ADC counts above dark_thr to wake */
+#define NIGHT_WAKE_STREAK       6    /* consecutive ~10s samples to confirm */
+#define NIGHT_LIGHT_CHECK_MS  10000UL
 
 /* Operator-forced storm (via HA / mesh).  Sticky: set by !park,
  * cleared only by !release.  Blocks dwell exit while set. */
@@ -1344,6 +1401,7 @@ typedef enum {
     ST_MENU,
     ST_TRACK,
     ST_STORM,
+    ST_NIGHT_PARK,      /* autonomous low-light park (east + flat) */
     ST_JOG,
     ST_CAL,
     ST_BTEST,           /* backlash characterization */
@@ -1365,6 +1423,11 @@ typedef enum {
     SET_TRACK_THRESH,
     SET_ROLE,              /* new */
     SET_WIND_SOURCE,       /* new */
+    SET_NIGHT_PARK_EN,     /* night-park: enable */
+    SET_NIGHT_PARK_AZ,     /* night-park: east position (0..100%) */
+    SET_NIGHT_PARK_EL,     /* night-park: tilt position (0..100%) */
+    SET_NIGHT_PARK_MIN,    /* night-park: minutes of darkness before parking */
+    SET_NIGHT_PARK_THR,    /* night-park: per-sensor ADC threshold for "dark" */
     SET_COUNT
 } setting_t;
 
@@ -1383,28 +1446,43 @@ static const setting_def_t setting_defs[SET_COUNT] = {
     { "TrkThr",   "Track thresh",   "adc", TRACK_THRESH_MIN, TRACK_THRESH_MAX },
     { "Role",     "Role 1=P 2=S",   "",    ROLE_MIN,         ROLE_MAX         },
     { "WSrc",     "Wind src 0L 1R", "",    WIND_SOURCE_MIN,  WIND_SOURCE_MAX  },
+    { "Night",    "Night-park ena", "",    0,                1                },
+    { "Nt.Az",    "Night east %",   "%",   0,                100              },
+    { "Nt.El",    "Night tilt %",   "%",   0,                100              },
+    { "Nt.Min",   "Night dark min", "min", NIGHT_PARK_DARK_MIN_MIN, NIGHT_PARK_DARK_MIN_MAX },
+    { "Nt.Thr",   "Night dark adc", "adc", NIGHT_PARK_DARK_THR_MIN, NIGHT_PARK_DARK_THR_MAX },
 };
 
 static unsigned char setting_get(setting_t s) {
     switch (s) {
-        case SET_WIND_STORM:   return wind_storm_mps;
-        case SET_WIND_RELEASE: return wind_release_mps;
-        case SET_STORM_DWELL:  return storm_dwell_min;
-        case SET_TRACK_THRESH: return track_thresh;
-        case SET_ROLE:         return role;            /* new */
-        case SET_WIND_SOURCE:  return wind_source;     /* new */
-        default:               return 0;
+        case SET_WIND_STORM:    return wind_storm_mps;
+        case SET_WIND_RELEASE:  return wind_release_mps;
+        case SET_STORM_DWELL:   return storm_dwell_min;
+        case SET_TRACK_THRESH:  return track_thresh;
+        case SET_ROLE:          return role;
+        case SET_WIND_SOURCE:   return wind_source;
+        case SET_NIGHT_PARK_EN: return night_park_enable;
+        case SET_NIGHT_PARK_AZ: return night_park_az_pct;
+        case SET_NIGHT_PARK_EL: return night_park_el_pct;
+        case SET_NIGHT_PARK_MIN: return night_park_dark_min;
+        case SET_NIGHT_PARK_THR: return night_park_dark_thr;
+        default:                return 0;
     }
 }
 
 static void setting_set(setting_t s, unsigned char v) {
     switch (s) {
-        case SET_WIND_STORM:   wind_storm_mps   = v; break;
-        case SET_WIND_RELEASE: wind_release_mps = v; break;
-        case SET_STORM_DWELL:  storm_dwell_min  = v; break;
-        case SET_TRACK_THRESH: track_thresh     = v; break;
-        case SET_ROLE:         role             = v; break;   /* new */
-        case SET_WIND_SOURCE:  wind_source      = v; break;   /* new */
+        case SET_WIND_STORM:    wind_storm_mps      = v; break;
+        case SET_WIND_RELEASE:  wind_release_mps    = v; break;
+        case SET_STORM_DWELL:   storm_dwell_min     = v; break;
+        case SET_TRACK_THRESH:  track_thresh        = v; break;
+        case SET_ROLE:          role                = v; break;
+        case SET_WIND_SOURCE:   wind_source         = v; break;
+        case SET_NIGHT_PARK_EN: night_park_enable   = v; break;
+        case SET_NIGHT_PARK_AZ: night_park_az_pct   = v; break;
+        case SET_NIGHT_PARK_EL: night_park_el_pct   = v; break;
+        case SET_NIGHT_PARK_MIN: night_park_dark_min = v; break;
+        case SET_NIGHT_PARK_THR: night_park_dark_thr = v; break;
         default: break;
     }
 }
@@ -1532,6 +1610,43 @@ static void track_tick(button_t pressed, state_t *state) {
     lcd_print(" dE=");
     lcd_print_sint3(track_dE);
     lcd_putc(' ');
+
+    /* Night-park entry check.  Uses the same sun samples (sn/ss/se/sw)
+     * computed in this tick if a fresh read happened, otherwise just
+     * skips this tick -- the next track period will re-sample.  Only
+     * ST_TRACK transitions to ST_NIGHT_PARK; calibration / menu / idle
+     * never do (those are operator-driven states). */
+    if (night_park_enable && now == track_last_check_ms) {
+        unsigned int sun_sum = sn + ss + se + sw;
+        unsigned char sun_avg = sim_dark_active
+                                    ? 0
+                                    : (unsigned char)(sun_sum >> 2);
+        if (sun_avg < night_park_dark_thr) {
+            if (!night_dark_armed) {
+                night_dark_start_ms = now;
+                night_dark_armed = 1;
+            }
+            if (now - night_dark_start_ms >= (unsigned long)night_park_dark_min * 60000UL) {
+                /* Engage night-park: seek east-flat target via goto framework. */
+                goto_az_target_pct = night_park_az_pct;
+                goto_el_target_pct = night_park_el_pct;
+                goto_active = 1;
+                night_light_streak = 0;
+                night_dark_armed = 0;
+                night_last_light_check_ms = now;
+                set_axis_ns(AXIS_OFF);
+                set_axis_ew(AXIS_OFF);
+                ns_pulse_end_ms = 0;
+                ew_pulse_end_ms = 0;
+                lcd_clear();
+                *state = ST_NIGHT_PARK;
+                return;
+            }
+        } else {
+            /* Any bright sample resets the timer. */
+            night_dark_armed = 0;
+        }
+    }
 
     if (pressed == BTN_QUIT) {
         set_axis_ns(AXIS_OFF);
@@ -1701,6 +1816,72 @@ static void storm_tick(state_t *state) {
     }
 }
 
+/* ---- Night-park (autonomous low-light parking) ----
+ *
+ * read_sun_avg_(): returns the average ADC reading across the 4 sun sensors,
+ * or 0 if sim_dark_active is set (bench hook).  Used by ST_TRACK to arm the
+ * dark timer and by night_park_tick to wake up.
+ *
+ * night_park_tick(): ST_NIGHT_PARK body.  The goto framework drives the
+ * actual move toward (night_park_az_pct, night_park_el_pct); this function
+ * polls the sun sensors every NIGHT_LIGHT_CHECK_MS (~10 s) and exits back
+ * to ST_TRACK once NIGHT_WAKE_STREAK consecutive samples read above
+ * (dark_thr + NIGHT_WAKE_HYSTERESIS).
+ *
+ * Storm preemption: handled by the existing storm_check() which runs
+ * unconditionally in the main loop -- it forces *state = ST_STORM from
+ * any source state, including ST_NIGHT_PARK. */
+static unsigned char read_sun_avg_(void) {
+    unsigned int sum;
+    if (sim_dark_active) return 0;
+    sum  = adc_read(ADC_CH_SUN_N);
+    sum += adc_read(ADC_CH_SUN_S);
+    sum += adc_read(ADC_CH_SUN_E);
+    sum += adc_read(ADC_CH_SUN_W);
+    return (unsigned char)(sum >> 2);
+}
+
+static void night_park_tick(state_t *state) {
+    unsigned long now = millis();
+    unsigned char avg;
+
+    /* LCD: row 0 "Night  GOTO" while goto_active, "Night  WAIT" while idle.
+     * Row 1: "Sun=avg/thr     ". */
+    lcd_goto(0, 0);
+    lcd_print_padded(goto_active ? "Night  GOTO" : "Night  WAIT", 16);
+
+    if (now - night_last_light_check_ms >= NIGHT_LIGHT_CHECK_MS) {
+        night_last_light_check_ms = now;
+        avg = read_sun_avg_();
+        if (avg > (unsigned char)(night_park_dark_thr + NIGHT_WAKE_HYSTERESIS)) {
+            if (night_light_streak < 255) night_light_streak++;
+            if (night_light_streak >= NIGHT_WAKE_STREAK) {
+                /* Wake up: cancel any in-flight goto, return to ST_TRACK. */
+                goto_active = 0;
+                night_light_streak = 0;
+                night_dark_armed = 0;
+                lcd_clear();
+                track_last_check_ms = now;
+                *state = ST_TRACK;
+                return;
+            }
+        } else {
+            night_light_streak = 0;
+        }
+
+        lcd_goto(1, 0);
+        lcd_print("Sun=");
+        lcd_putc('0' + ((avg / 100) % 10));
+        lcd_putc('0' + ((avg / 10) % 10));
+        lcd_putc('0' + (avg % 10));
+        lcd_putc('/');
+        lcd_putc('0' + ((night_park_dark_thr / 100) % 10));
+        lcd_putc('0' + ((night_park_dark_thr / 10) % 10));
+        lcd_putc('0' + (night_park_dark_thr % 10));
+        lcd_print_padded("", 6);   /* clear trailing chars */
+    }
+}
+
 /* ---- HA status responder (Phase 3-4, read-only) ----
  * On a valid framed `?` poll, reply with one framed status packet:
  *   az=<ew%> el=<ns%> wind=<mps> mode=<m>
@@ -1716,6 +1897,7 @@ static const char *uart_mode_str(state_t st) {
         case ST_MENU:          return "menu";
         case ST_TRACK:         return "track";
         case ST_STORM:         return "storm";
+        case ST_NIGHT_PARK:    return "night";
         case ST_CAL:           return "cal";
         case ST_BTEST:         return "btest";
         case ST_SETTINGS:      return "set";
@@ -1913,6 +2095,20 @@ static void uart_cmd_dispatch(state_t *state) {
         return;
     }
 
+    /* !sim_dark on/off -- bench-test hook for night-park.  When ON, the
+     * read_sun_avg_() helper returns 0 regardless of actual ADC readings,
+     * so the dark-timer fires within night_park_dark_min minutes without
+     * physically occluding the sensors.  Cleared on !sim_dark off (or by
+     * reboot, since the flag is not persisted to EEPROM). */
+    if (strncmp(p + 1, "sim_dark ", 9) == 0) {
+        const char *q = p + 10;
+        if (q[0] == 'o' && q[1] == 'n' && (q[2] == '\0' || q[2] == ' '))
+            sim_dark_active = 1;
+        else if (q[0] == 'o' && q[1] == 'f' && q[2] == 'f' && (q[3] == '\0' || q[3] == ' '))
+            sim_dark_active = 0;
+        return;
+    }
+
     /* !cfg get id=NN -- read config field */
     if (strncmp(p + 1, "cfg get id=", 11) == 0) {
         const char *q = p + 12;
@@ -1923,6 +2119,11 @@ static void uart_cmd_dispatch(state_t *state) {
             case CFG_F_WIND_RELEASE:  uart_cfg_send_value(id, wind_release_mps); return;
             case CFG_F_STORM_DWELL:   uart_cfg_send_value(id, storm_dwell_min); return;
             case CFG_F_TRACK_THRESH:  uart_cfg_send_value(id, track_thresh); return;
+            case CFG_F_NIGHT_PARK_EN:  uart_cfg_send_value(id, night_park_enable);   return;
+            case CFG_F_NIGHT_PARK_AZ:  uart_cfg_send_value(id, night_park_az_pct);   return;
+            case CFG_F_NIGHT_PARK_EL:  uart_cfg_send_value(id, night_park_el_pct);   return;
+            case CFG_F_NIGHT_PARK_MIN: uart_cfg_send_value(id, night_park_dark_min); return;
+            case CFG_F_NIGHT_PARK_THR: uart_cfg_send_value(id, night_park_dark_thr); return;
             case CFG_F_NS_STROKE:     uart_cfg_send_value(id, ns_stroke_ms); return;
             case CFG_F_EW_STROKE:     uart_cfg_send_value(id, ew_stroke_ms); return;
             case CFG_F_HORIZ_NS:      uart_cfg_send_value(id, horiz_ns_pct); return;
@@ -1961,6 +2162,26 @@ static void uart_cmd_dispatch(state_t *state) {
             case CFG_F_TRACK_THRESH:
                 if (val < TRACK_THRESH_MIN || val > TRACK_THRESH_MAX) status = CFG_STATUS_RANGE;
                 else { track_thresh = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_NIGHT_PARK_EN:
+                if (val > 1) status = CFG_STATUS_RANGE;
+                else { night_park_enable = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_NIGHT_PARK_AZ:
+                if (val > 100) status = CFG_STATUS_RANGE;
+                else { night_park_az_pct = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_NIGHT_PARK_EL:
+                if (val > 100) status = CFG_STATUS_RANGE;
+                else { night_park_el_pct = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_NIGHT_PARK_MIN:
+                if (val < NIGHT_PARK_DARK_MIN_MIN || val > NIGHT_PARK_DARK_MIN_MAX) status = CFG_STATUS_RANGE;
+                else { night_park_dark_min = (unsigned char)val; config_save(); }
+                break;
+            case CFG_F_NIGHT_PARK_THR:
+                if (val < NIGHT_PARK_DARK_THR_MIN || val > NIGHT_PARK_DARK_THR_MAX) status = CFG_STATUS_RANGE;
+                else { night_park_dark_thr = (unsigned char)val; config_save(); }
                 break;
             case CFG_F_WIND_SOURCE:
                 /* P6-2: mesh-managed.  ESP auto-pushes this on election change
@@ -2539,6 +2760,10 @@ void main(void) {
 
         case ST_STORM:
             storm_tick(&state);
+            break;
+
+        case ST_NIGHT_PARK:
+            night_park_tick(&state);
             break;
 
         case ST_CAL: {
