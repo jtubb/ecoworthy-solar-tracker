@@ -49,11 +49,10 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   min_auth_mode: WPA2
-  manual_ip:
-    static_ip: 192.168.1.194
-    gateway: 192.168.1.254
-    subnet: 255.255.255.0
-    dns1: 192.168.50.1
+  # OTA-from-dashboard relies on this hostname resolving to the device's
+  # DHCP-assigned IP.  Mikrotik DNS reservations register `${device_name}.home.local`
+  # for each tracker, so the dashboard does not need a hardcoded IP.
+  use_address: ${device_name}.home.local
   ap:
     ssid: "${device_name} Fallback"
     password: !secret fallback_password
