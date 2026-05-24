@@ -358,20 +358,26 @@ class TestHarness:
         for oid, info in infos.items():
             if oid.endswith(suffix) or oid == key:
                 return info
-        # Last resort: token-overlap match.  Splits both sides on `_` and
-        # accepts if every token in `key` appears as a token in `oid` (or
-        # as a substring of one).  Handles "storm_dwell_min" vs
-        # "solar_tracker_1_storm_dwell" -- the test's `_min` token doesn't
-        # need to match anything in the object_id, but "storm" and "dwell"
-        # do.  Returns the first such match.
-        key_tokens = [t for t in key.split("_") if t]
+        # Last resort: token-overlap match.  Scores each entity by how many
+        # of the key's tokens appear (as substrings) in the object_id, and
+        # returns the BEST scorer above the minimum threshold.  Returning
+        # the first-passing scorer (older behavior) was incorrect when two
+        # entities shared most of their tokens -- e.g. for key
+        # "night_park_dark_thr" against "_night_park_dark_minutes" and
+        # "_night_park_dark_threshold", both scored 3+ but the first one
+        # in dict order was the WRONG match.  Score-then-pick-best fixes
+        # this without breaking the original "fuzzy is fuzzy" intent.
+        key_tokens = [t.lower() for t in key.split("_") if t]
+        min_required = max(1, min(2, len(key_tokens)))
+        best_score = 0
+        best_info = None
         for oid, info in infos.items():
             oid_str = oid.lower()
-            shared = sum(1 for t in key_tokens if t.lower() in oid_str)
-            # Require >= 2 shared tokens, or 1 if key_tokens is length 1
-            if shared >= max(1, min(2, len(key_tokens))):
-                return info
-        return None
+            shared = sum(1 for t in key_tokens if t in oid_str)
+            if shared >= min_required and shared > best_score:
+                best_score = shared
+                best_info = info
+        return best_info
 
     def _resolve_entity_or_fail(self, op: str, name: str, key: str) -> object:
         info = self._resolve_entity(name, key)
@@ -1088,8 +1094,21 @@ async def test_night_park_engages_after_dark_timer(h: TestHarness) -> None:
     """
     Set dark_min to 1 minute, turn on Sim Dark, verify mode transitions to
     "night" within ~80 s.  Restore in finally.
+
+    SKIPS when the tracker is already in mode=night (actual ambient
+    darkness): sim_dark has no observable effect since real sun_avg is
+    already below the threshold, and the test would pass trivially
+    without exercising the engagement path.  Run during daytime to
+    validate.
     """
     t1 = "solar-tracker-1"
+    current_mode = h._entity_state[t1].get("solar_tracker_1_mode")
+    if current_mode == "night":
+        raise _ManualSkip(
+            "tracker-1 is in mode=night (real-world darkness).  sim_dark "
+            "has no observable effect when actual sun_avg < dark_thr.  "
+            "Run this test during daytime."
+        )
     orig_dark_min = h._entity_state[t1].get("night_park_dark_min")
     orig_enable   = h._entity_state[t1].get("night_park_enable")
     await h.set_number(t1, "night_park_enable", 1.0)
@@ -1121,8 +1140,19 @@ async def test_night_park_releases_on_light_return(h: TestHarness) -> None:
     returns to "track" within ~90 s (6 consecutive ~10s bright samples
     + margin).  Storm preemption is exercised separately by force_park
     tests.
+
+    SKIPS when actual ambient is dark: with real sun_avg < dark_thr,
+    turning sim_dark off doesn't change anything (real-dark continues),
+    so the mode=track assertion would never be satisfied.
     """
     t1 = "solar-tracker-1"
+    current_mode = h._entity_state[t1].get("solar_tracker_1_mode")
+    if current_mode == "night":
+        raise _ManualSkip(
+            "tracker-1 is in mode=night (real-world darkness).  Release "
+            "path can't be validated when actual sun_avg stays below "
+            "dark_thr.  Run this test during daytime."
+        )
     orig_dark_min = h._entity_state[t1].get("night_park_dark_min")
     orig_enable   = h._entity_state[t1].get("night_park_enable")
     await h.set_number(t1, "night_park_enable", 1.0)
