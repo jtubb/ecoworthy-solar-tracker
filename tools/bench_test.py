@@ -1092,8 +1092,9 @@ async def test_cfg_get_resp_readback(h: TestHarness) -> None:
 
 async def test_night_park_engages_after_dark_timer(h: TestHarness) -> None:
     """
-    Set dark_min to 1 minute, turn on Sim Dark, verify mode transitions to
-    "night" within ~80 s.  Restore in finally.
+    Drive tracker-1 to ST_TRACK (via Resume Tracking switch if needed),
+    set dark_min to 1 minute, turn on Sim Dark, verify mode transitions
+    to "night" within ~80 s.  Restore in finally.
 
     SKIPS when the tracker is already in mode=night (actual ambient
     darkness): sim_dark has no observable effect since real sun_avg is
@@ -1109,6 +1110,15 @@ async def test_night_park_engages_after_dark_timer(h: TestHarness) -> None:
             "has no observable effect when actual sun_avg < dark_thr.  "
             "Run this test during daytime."
         )
+    # Ensure tracker is in ST_TRACK: the dark-timer entry check is in
+    # track_tick, so engagement only fires from track mode.  Resume
+    # Tracking switch pulses !track (no-op if already in ST_TRACK).
+    if current_mode != "track":
+        await h.set_switch(t1, "resume_tracking_switch", True)
+        await asyncio.sleep(2)
+        # The switch auto-resets to off after 500ms; the STC should now
+        # be in ST_TRACK if cfg was valid.  Don't fail here -- the
+        # subsequent expect_entity(mode=night) will surface it if not.
     orig_dark_min = h._entity_state[t1].get("night_park_dark_min")
     orig_enable   = h._entity_state[t1].get("night_park_enable")
     await h.set_number(t1, "night_park_enable", 1.0)
@@ -1136,10 +1146,10 @@ async def test_night_park_engages_after_dark_timer(h: TestHarness) -> None:
 
 async def test_night_park_releases_on_light_return(h: TestHarness) -> None:
     """
-    Engage night-park via sim_dark, then turn sim_dark off and verify mode
-    returns to "track" within ~90 s (6 consecutive ~10s bright samples
-    + margin).  Storm preemption is exercised separately by force_park
-    tests.
+    Drive tracker-1 to ST_TRACK, engage night-park via sim_dark, then
+    turn sim_dark off and verify mode returns to "track" within ~90 s
+    (6 consecutive ~10s bright samples + margin).  Storm preemption is
+    exercised separately by force_park tests.
 
     SKIPS when actual ambient is dark: with real sun_avg < dark_thr,
     turning sim_dark off doesn't change anything (real-dark continues),
@@ -1153,6 +1163,9 @@ async def test_night_park_releases_on_light_return(h: TestHarness) -> None:
             "path can't be validated when actual sun_avg stays below "
             "dark_thr.  Run this test during daytime."
         )
+    if current_mode != "track":
+        await h.set_switch(t1, "resume_tracking_switch", True)
+        await asyncio.sleep(2)
     orig_dark_min = h._entity_state[t1].get("night_park_dark_min")
     orig_enable   = h._entity_state[t1].get("night_park_enable")
     await h.set_number(t1, "night_park_enable", 1.0)

@@ -2095,6 +2095,18 @@ static void uart_cmd_dispatch(state_t *state) {
         return;
     }
 
+    /* !track -- enter ST_TRACK from ST_IDLE.  No-op from other states
+     * (storm/cal/menu are operator-driven; force the operator to QUIT
+     * first if they want to switch).  Lets the bench harness drive
+     * tracking without LCD button presses. */
+    if (strncmp(p + 1, "track", 5) == 0 && p[6] == '\0') {
+        if (*state == ST_IDLE && !storm_forced && cfg_valid) {
+            track_last_check_ms = millis();   /* fresh tracking eval */
+            *state = ST_TRACK;
+        }
+        return;
+    }
+
     /* !sim_dark on/off -- bench-test hook for night-park.  When ON, the
      * read_sun_avg_() helper returns 0 regardless of actual ADC readings,
      * so the dark-timer fires within night_park_dark_min minutes without

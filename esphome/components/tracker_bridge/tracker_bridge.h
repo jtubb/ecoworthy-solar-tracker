@@ -235,6 +235,15 @@ class TrackerBridge : public Component, public uart::UARTDevice {
     write_str_frame_(cmd);
   }
 
+  /* Bench hook: send !track to move the STC from ST_IDLE -> ST_TRACK.
+   * No-op from any other state (the STC firmware enforces the IDLE-only
+   * guard).  Lets the harness drive tracking without LCD button presses,
+   * which is a prerequisite for the night-park tests (the dark-timer
+   * entry check only runs in ST_TRACK). */
+  void enter_track_mode() {
+    write_str_frame_("!track");
+  }
+
   /* Bench-helper write path for the wind cache.  Used by the optional
    * WindOverrideNumber to inject synthetic wind values on a node with
    * no STC attached.  On a node WITH an STC, the next status poll (~2 s

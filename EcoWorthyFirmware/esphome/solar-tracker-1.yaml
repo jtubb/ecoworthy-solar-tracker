@@ -211,6 +211,21 @@ switch:
       - lambda: id(bridge).night_park_set_sim_dark(true);
     turn_off_action:
       - lambda: id(bridge).night_park_set_sim_dark(false);
+  # Pulse to enter ST_TRACK from ST_IDLE (no-op otherwise).  Bench-test
+  # prerequisite for night-park, since the dark-timer entry check only
+  # runs from track mode.  Auto-resets to OFF after a brief pulse.
+  - platform: template
+    name: "$friendly_name Resume Tracking"
+    id: resume_tracking_switch
+    optimistic: true
+    entity_category: diagnostic
+    icon: mdi:play
+    turn_on_action:
+      - lambda: id(bridge).enter_track_mode();
+      - delay: 500ms
+      - switch.turn_off: resume_tracking_switch
+    turn_off_action:
+      - lambda: ;
 
 # --- Debug: runtime baud-rate select (leave at 9600 unless debugging) --
 select:
