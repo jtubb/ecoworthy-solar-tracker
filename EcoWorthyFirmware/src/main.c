@@ -508,7 +508,7 @@ static void config_valid_refresh(void) { cfg_valid = config_is_valid(); }
  *   15    : night_park_az_pct (0..100; 100 = full east per CLAUDE.md quirk 5)
  *   16    : night_park_el_pct (0..100; 50 = flat)
  *   17    : night_park_dark_min (1..120; minutes of darkness before parking)
- *   18    : night_park_dark_thr (5..200; per-sensor ADC threshold for "dark")
+ *   18    : night_park_dark_thr (5..200; per-sensor ADC threshold for "dark"; default 15)
  */
 static unsigned int ns_stroke_ms = 0;
 static unsigned int ew_stroke_ms = 0;
@@ -530,7 +530,7 @@ static unsigned char night_park_enable   = 1;
 static unsigned char night_park_az_pct   = 100;  /* full east */
 static unsigned char night_park_el_pct   = 50;   /* flat */
 static unsigned char night_park_dark_min = 30;
-static unsigned char night_park_dark_thr = 30;
+static unsigned char night_park_dark_thr = 15;   /* only engage when actually dark */
 
 /* Setting range bounds.  Used by ST_SETTINGS_EDIT for clamping and
  * by config_load() for sanity-checking unprogrammed EEPROM bytes. */
@@ -617,7 +617,7 @@ static void config_load(void) {
     if (night_park_dark_min < NIGHT_PARK_DARK_MIN_MIN || night_park_dark_min > NIGHT_PARK_DARK_MIN_MAX)
         night_park_dark_min = 30;
     if (night_park_dark_thr < NIGHT_PARK_DARK_THR_MIN || night_park_dark_thr > NIGHT_PARK_DARK_THR_MAX)
-        night_park_dark_thr = 30;
+        night_park_dark_thr = 15;
     /* Invariant: release threshold must be strictly less than storm threshold. */
     if (wind_release_mps >= wind_storm_mps)
         wind_release_mps = (wind_storm_mps > 0) ? wind_storm_mps - 1 : 0;
