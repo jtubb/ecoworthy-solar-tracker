@@ -893,7 +893,13 @@ static void duty_tick(void) {
     }
 
     if (ns_duty_lockout_end != 0) {
-        if (now >= ns_duty_lockout_end) {
+        /* Wrap-safe deadline check (P5-18): signed-diff of unsigned ms.
+         * `now >= end` is broken when `end = now_at_set + DUTY_OFF_LOCKOUT_MS`
+         * wraps past 0xFFFFFFFF -- the bare unsigned compare would clear the
+         * lockout early.  Treating the subtraction as signed long handles
+         * the wrap correctly for any deadline within ±24.85 days, which
+         * covers DUTY_OFF_LOCKOUT_MS (18 min) with massive headroom. */
+        if ((long)(now - ns_duty_lockout_end) >= 0) {
             ns_duty_lockout_end = 0;
             ns_duty_on_ms = 0;
         }
@@ -906,7 +912,7 @@ static void duty_tick(void) {
     }
 
     if (ew_duty_lockout_end != 0) {
-        if (now >= ew_duty_lockout_end) {
+        if ((long)(now - ew_duty_lockout_end) >= 0) {
             ew_duty_lockout_end = 0;
             ew_duty_on_ms = 0;
         }
@@ -1556,12 +1562,14 @@ static void track_tick(button_t pressed, state_t *state) {
 
     now = millis();
 
-    /* End expired pulses. */
-    if (ns_pulse_end_ms != 0 && now >= ns_pulse_end_ms) {
+    /* End expired pulses.  P5-18: signed-diff of unsigned ms is wrap-safe;
+     * `now >= end` would mis-trigger when the millis() 32-bit counter rolls
+     * over (~49.7 days) and the pulse was started near the boundary. */
+    if (ns_pulse_end_ms != 0 && (long)(now - ns_pulse_end_ms) >= 0) {
         set_axis_ns(AXIS_OFF);
         ns_pulse_end_ms = 0;
     }
-    if (ew_pulse_end_ms != 0 && now >= ew_pulse_end_ms) {
+    if (ew_pulse_end_ms != 0 && (long)(now - ew_pulse_end_ms) >= 0) {
         set_axis_ew(AXIS_OFF);
         ew_pulse_end_ms = 0;
     }
@@ -1618,9 +1626,14 @@ static void track_tick(button_t pressed, state_t *state) {
      * never do (those are operator-driven states). */
     if (night_park_enable && now == track_last_check_ms) {
         unsigned int sun_sum = sn + ss + se + sw;
+        unsigned int sun_avg_raw = sun_sum >> 2;
+        /* P5-19: saturate at 255 before the uint8 compare.  See
+         * read_sun_avg_() for the full rationale. */
         unsigned char sun_avg = sim_dark_active
                                     ? 0
-                                    : (unsigned char)(sun_sum >> 2);
+                                    : (sun_avg_raw > 255
+                                           ? 255
+                                           : (unsigned char)sun_avg_raw);
         if (sun_avg < night_park_dark_thr) {
             if (!night_dark_armed) {
                 night_dark_start_ms = now;
@@ -1833,12 +1846,20 @@ static void storm_tick(state_t *state) {
  * any source state, including ST_NIGHT_PARK. */
 static unsigned char read_sun_avg_(void) {
     unsigned int sum;
+    unsigned int avg;
     if (sim_dark_active) return 0;
     sum  = adc_read(ADC_CH_SUN_N);
     sum += adc_read(ADC_CH_SUN_S);
     sum += adc_read(ADC_CH_SUN_E);
     sum += adc_read(ADC_CH_SUN_W);
-    return (unsigned char)(sum >> 2);
+    /* P5-19: saturate at 255 before the uint8 cast.  ADC is 10-bit so
+     * sum/4 can be 0..1023; bare truncation makes values 256..1023 alias
+     * to (avg & 0xFF), which can drop a bright reading below dark_thr
+     * and spuriously engage night-park.  All comparisons against dark_thr
+     * (range 5..200) treat "above 255" identically, so saturation is
+     * value-preserving for the use case. */
+    avg = sum >> 2;
+    return (avg > 255) ? 255 : (unsigned char)avg;
 }
 
 static void night_park_tick(state_t *state) {
